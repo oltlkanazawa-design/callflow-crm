@@ -1,0 +1,32 @@
+@import "tailwindcss";
+
+:root {
+  --nav: #111a2e;
+  --nav-active: #1d2943;
+  --ink: #172036;
+  --muted: #718096;
+  --line: #e4e9f1;
+  --bg: #f5f7fb;
+  --primary: #3a69e8;
+}
+
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body { margin: 0; background: var(--bg); color: var(--ink); font-family: Inter, "Noto Sans JP", system-ui, -apple-system, sans-serif; }
+button, input, select, textarea { font: inherit; }
+button { cursor: pointer; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #cbd4e2; border-radius: 8px; }
+
+.card { background: #fff; border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 2px 10px rgba(30, 47, 80, .035); }
+.input { width: 100%; border: 1px solid var(--line); border-radius: 9px; background: #fff; padding: 10px 12px; outline: none; transition: .15s; }
+.input:focus { border-color: #8ba8f5; box-shadow: 0 0 0 3px rgba(58, 105, 232, .1); }
+.btn { display: inline-flex; align-items: center; justify-content: center; gap: 7px; border: 0; border-radius: 9px; padding: 10px 14px; font-size: 13px; font-weight: 750; transition: .15s; }
+.btn-primary { color: white; background: var(--primary); }
+.btn-primary:hover { background: #2c57cf; transform: translateY(-1px); }
+.btn-light { color: var(--ink); background: white; border: 1px solid var(--line); }
+.btn-light:hover { background: #f8faff; }
+.btn-ai { color: white; background: linear-gradient(135deg, #684fce, #9562dd); }
+.badge { display: inline-flex; align-items: center; border-radius: 20px; padding: 4px 8px; font-size: 10px; font-weight: 750; }
+.fade-in { animation: fade .18s ease-out; }
+@keyframes fade { from { opacity: 0; transform: translateY(3px); } }
