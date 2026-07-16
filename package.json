@@ -7,7 +7,8 @@
     "appserver": "next dev --hostname 0.0.0.0",
     "build": "next build",
     "start": "next start --hostname 0.0.0.0",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --test src/lib/*.test.ts"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.1",

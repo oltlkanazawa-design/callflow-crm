@@ -26,6 +26,15 @@ Vercel Free
 5. 作成したユーザーのUUIDをコピーします。
 6. `supabase/init-free-production.sql` を開き、`AUTH_USER_UUID` を置換して実行します。
 
+## 2.5 CSV一括登録機能を使う場合の必須手順（重要）
+
+**このバージョンには「CSV一括登録」機能が含まれており、`companies`テーブルに`email`列が必要です。**
+
+- **新規にSupabaseプロジェクトを作成する場合**：手順2で実行する`supabase/schema.sql`に`email`列が最初から含まれているため、追加の作業は不要です。
+- **既にこのCRMを本番運用していて、今回このバージョンへアップデートする場合**：`schema.sql`は再実行しないため、`email`列が既存の`companies`テーブルに存在しません。**デプロイ前に必ず`supabase/add-company-email-column.sql`をSupabaseのSQL Editorで実行してください。**
+
+**この手順を飛ばしてデプロイすると何が起きるか**：CSV一括登録機能を使った瞬間、登録しようとした行が1件も保存されずすべてエラーになります（既存データが壊れることはありませんが、営業担当が「CSVをアップロードしたのに何も登録されない」という状態に直面します）。
+
 ## 3. Vercel Freeへデプロイ
 
 1. Vercelで「Add New Project」を選びます。

@@ -2,6 +2,15 @@ import { createClient, isDemoModeAllowed, isSupabaseConfigured } from "./supabas
 import { demoCompanies, demoLogs } from "./demo-data";
 import type { CallLog, Company } from "./types";
 
+// Supabaseの技術的なエラーメッセージのうち、既知のパターンは営業担当にも分かる文言へ変換する
+function friendlyDbErrorMessage(error: { message?: string } | null | undefined, fallback: string): string {
+  const msg = error?.message || "";
+  if (/email/i.test(msg) && /(does not exist|could not find)/i.test(msg)) {
+    return "emailの列がデータベースにまだ追加されていません（add-company-email-column.sqlの実行が必要です）";
+  }
+  return msg || fallback;
+}
+
 const COMPANY_KEY = "callflow_companies_v1";
 const LOG_KEY = "callflow_logs_v1";
 
@@ -52,6 +61,64 @@ export async function saveCompany(company: Company): Promise<Company> {
   }).select().single();
   if (error) throw error;
   return { ...data, owner_name: company.owner_name } as Company;
+}
+
+export async function saveCompaniesBulk(companies: Company[]): Promise<{ saved: Company[]; errors: { index: number; message: string }[] }> {
+  if (!companies.length) return { saved: [], errors: [] };
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    try {
+      const current = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+      localStorage.setItem(COMPANY_KEY, JSON.stringify([...companies, ...current]));
+      return { saved: companies, errors: [] };
+    } catch (e) {
+      return { saved: [], errors: companies.map((_, index) => ({ index, message: e instanceof Error ? e.message : "保存に失敗しました" })) };
+    }
+  }
+  const supabase = createClient();
+  const { data: auth } = await supabase.auth.getUser();
+  if (!auth.user) throw new Error("ログインが必要です");
+  const { data: profile, error: profileError } = await supabase.from("profiles").select("organization_id,id").eq("id", auth.user.id).single();
+  if (profileError) throw profileError;
+
+  const toRow = (c: Company) => ({
+    organization_id: profile!.organization_id, name: c.name, industry: c.industry, location: c.location, phone: c.phone,
+    website_url: c.website_url || null, source_url: c.source_url || null, list_source: c.list_source || null, email: c.email || null,
+    contact_name: c.contact_name, contact_department: c.contact_department, heat: c.heat, memo: c.memo, owner_id: profile!.id,
+  });
+
+  const saved: Company[] = [];
+  const errors: { index: number; message: string }[] = [];
+  const chunkSize = 25;
+  for (let start = 0; start < companies.length; start += chunkSize) {
+    const chunk = companies.slice(start, start + chunkSize);
+    const { data, error } = await supabase.from("companies").insert(chunk.map(toRow)).select();
+    if (!error && data) {
+      saved.push(...(data.map((d, i) => ({ ...d, owner_name: chunk[i].owner_name })) as Company[]));
+      continue;
+    }
+    // チャンク全体のinsertが失敗した場合のみ、原因の行を特定するため1件ずつ登録し直す
+    for (let i = 0; i < chunk.length; i++) {
+      const { data: single, error: singleError } = await supabase.from("companies").insert(toRow(chunk[i])).select().single();
+      if (singleError) errors.push({ index: start + i, message: friendlyDbErrorMessage(singleError, "登録に失敗しました") });
+      else saved.push({ ...single, owner_name: chunk[i].owner_name } as Company);
+    }
+  }
+  return { saved, errors };
+}
+
+export async function updateCompany(id: string, patch: Partial<Omit<Company, "id" | "owner_name">>): Promise<Company> {
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const current = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+    const updated = current.map(c => c.id === id ? { ...c, ...patch } : c);
+    localStorage.setItem(COMPANY_KEY, JSON.stringify(updated));
+    return updated.find(c => c.id === id)!;
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.from("companies").update(patch).eq("id", id).select().single();
+  if (error) throw new Error(friendlyDbErrorMessage(error, "更新に失敗しました"));
+  return { ...data, owner_name: "" } as Company;
 }
 
 export async function saveCallLog(log: CallLog, company: Company): Promise<void> {
