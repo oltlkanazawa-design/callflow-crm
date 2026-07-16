@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   parseCsvText, detectDelimiter, autoDetectMapping, buildRows, summarizeRows,
-  rowToCompanyDraft, decodeCsvFile, normalizePhone, urlDomain, normalizeName, toHalfWidthDigits,
+  rowToCompanyDraft, buildCompanyUpdatePatch, decodeCsvFile, normalizePhone, urlDomain, normalizeName, toHalfWidthDigits,
 } from "./csv-import.ts";
 import type { Company } from "./types.ts";
 
@@ -236,4 +236,66 @@ test("大量データ(1000件)でも件数・重複判定が正しく成立す�
   assert.equal(summary.total, 1000);
   assert.equal(summary.validCount, 1000);
   assert.equal(summary.duplicateCount, 0);
+});
+
+const existingForUpdate: Company = {
+  id: "e2", name: "既存企業", industry: "既存業種", location: "既存所在地", phone: "076-000-0000",
+  website_url: "https://existing.example.com", email: "existing@example.com", list_source: "既存リスト",
+  contact_name: "既存担当者", contact_department: "既存部署", heat: "高", owner_name: "既存担当", memo: "既存メモ",
+};
+function draftRow(overrides: Partial<{ name: string; phone: string; website_url: string; location: string; industry: string; contact_name: string; email: string; memo: string; list_source: string }>) {
+  const base = { rowIndex: 0, raw: [], name: "", phone: "", website_url: "", location: "", industry: "", contact_name: "", email: "", memo: "", list_source: "", errors: [], warnings: [], duplicate: null };
+  return { ...base, ...overrides };
+}
+
+test("buildCompanyUpdatePatch: CSVの所在地・業種・担当者名が空欄なら既存値が残る（patchに含まれない）", () => {
+  const row = draftRow({ name: "既存企業", phone: "076-000-0000" });
+  const patch = buildCompanyUpdatePatch(row, existingForUpdate, "");
+  assert.equal("location" in patch, false);
+  assert.equal("industry" in patch, false);
+  assert.equal("contact_name" in patch, false);
+});
+
+test("buildCompanyUpdatePatch: CSVに値があれば既存値を上書きする", () => {
+  const row = draftRow({ name: "新企業名", location: "新所在地", industry: "新業種", contact_name: "新担当者" });
+  const patch = buildCompanyUpdatePatch(row, existingForUpdate, "");
+  assert.equal(patch.name, "新企業名");
+  assert.equal(patch.location, "新所在地");
+  assert.equal(patch.industry, "新業種");
+  assert.equal(patch.contact_name, "新担当者");
+});
+
+test("buildCompanyUpdatePatch: 全角電話番号が半角化される", () => {
+  const row = draftRow({ phone: "０７６－９９９－９９９９" });
+  const patch = buildCompanyUpdatePatch(row, existingForUpdate, "");
+  assert.equal(patch.phone, "076-999-9999");
+});
+
+test("buildCompanyUpdatePatch: プロトコル無しのURLにhttps://が付与される", () => {
+  const row = draftRow({ website_url: "example.com" });
+  const patch = buildCompanyUpdatePatch(row, existingForUpdate, "");
+  assert.equal(patch.website_url, "https://example.com");
+});
+
+test("buildCompanyUpdatePatch: メモが空欄なら既存メモを残す（patchに含まれない）", () => {
+  const row = draftRow({ name: "既存企業" });
+  const patch = buildCompanyUpdatePatch(row, existingForUpdate, "");
+  assert.equal("memo" in patch, false);
+});
+
+test("buildCompanyUpdatePatch: リスト名が空欄（CSV・既定値とも）なら既存リスト名を残す（patchに含まれない）", () => {
+  const row = draftRow({ name: "既存企業" });
+  const patch = buildCompanyUpdatePatch(row, existingForUpdate, "");
+  assert.equal("list_source" in patch, false);
+});
+
+test("buildCompanyUpdatePatch: id・organization_id・owner_id・owner_name・contact_department・heatはpatchに含まれない", () => {
+  const row = draftRow({ name: "新企業名", phone: "076-111-1111", location: "新所在地", industry: "新業種", contact_name: "新担当者", email: "new@example.com", memo: "新メモ", website_url: "https://new.example.com" });
+  const patch = buildCompanyUpdatePatch(row, existingForUpdate, "新リスト");
+  assert.equal("id" in patch, false);
+  assert.equal("organization_id" in patch, false);
+  assert.equal("owner_id" in patch, false);
+  assert.equal("owner_name" in patch, false);
+  assert.equal("contact_department" in patch, false);
+  assert.equal("heat" in patch, false);
 });

@@ -6,7 +6,7 @@ import { loadCRMData, saveCallLog, saveCompaniesBulk, saveCompany, updateCompany
 import { isSupabaseConfigured, createClient } from "@/lib/supabase/client";
 import type { CallLog, CallResult, Company, Heat, TranscriptAnalysis } from "@/lib/types";
 import {
-  autoDetectMapping, buildErrorReportCsv, buildRows, decodeCsvFile, detectDelimiter, parseCsvText,
+  autoDetectMapping, buildCompanyUpdatePatch, buildErrorReportCsv, buildRows, decodeCsvFile, detectDelimiter, parseCsvText,
   rowToCompanyDraft, summarizeRows, CANONICAL_FIELD_LABELS, CANONICAL_FIELD_ORDER, DUPLICATE_TIER_LABELS,
 } from "@/lib/csv-import";
 import type { CanonicalField, ColumnMapping, CsvRowResult, DuplicateMode } from "@/lib/csv-import";
@@ -171,7 +171,7 @@ function CsvImportModal({member,existing,close,saved}:{member:string;existing:Co
    for(const row of toUpdate){
     const target=row.duplicate!.matchedExisting!;
     try{
-     await updateCompany(target.id,{name:row.name,phone:row.phone,website_url:row.website_url||undefined,location:row.location,industry:row.industry,contact_name:row.contact_name,email:row.email||undefined,list_source:row.list_source||listSource||target.list_source});
+     await updateCompany(target.id,buildCompanyUpdatePatch(row,target,listSource));
      updatedOk++;
     }catch(e){updateErrors.push({index:row.rowIndex,message:e instanceof Error?e.message:"更新に失敗しました"})}
    }

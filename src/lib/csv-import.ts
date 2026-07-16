@@ -268,6 +268,26 @@ export function rowToCompanyDraft(row: CsvRowResult, owner: string, defaultListS
   };
 }
 
+/** 重複更新用のpatchを組み立てる。CSV側が空欄の項目は既存企業の値を保持し、上書きしない */
+export function buildCompanyUpdatePatch(
+  row: CsvRowResult,
+  existing: Company,
+  defaultListSource: string,
+): Partial<Omit<Company, "id" | "owner_name">> {
+  const patch: Partial<Omit<Company, "id" | "owner_name">> = {};
+  if (row.name) patch.name = row.name;
+  if (row.phone) patch.phone = toHalfWidthDigits(row.phone);
+  if (row.website_url) patch.website_url = normalizeUrlValue(row.website_url);
+  if (row.location) patch.location = row.location;
+  if (row.industry) patch.industry = row.industry;
+  if (row.contact_name) patch.contact_name = row.contact_name;
+  if (row.email) patch.email = row.email;
+  if (row.memo) patch.memo = row.memo;
+  const listSource = row.list_source || defaultListSource;
+  if (listSource) patch.list_source = listSource;
+  return patch;
+}
+
 function escapeCsvField(v: string): string {
   return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
 }
