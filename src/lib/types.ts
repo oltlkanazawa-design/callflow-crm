@@ -10,6 +10,7 @@ export interface Company {
   website_url?: string;
   source_url?: string;
   list_source?: string;
+  email?: string;
   contact_name: string;
   contact_department?: string;
   heat: Heat;

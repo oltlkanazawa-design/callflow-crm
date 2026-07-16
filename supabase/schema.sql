@@ -21,7 +21,7 @@ create table public.companies (
   organization_id uuid not null references public.organizations(id) on delete cascade,
   name text not null,
   industry text not null default '', location text not null default '', phone text not null,
-  website_url text, source_url text, list_source text,
+  website_url text, source_url text, list_source text, email text,
   contact_name text not null default '', contact_department text not null default '',
   heat text not null default '低' check (heat in ('高','中','低')),
   owner_id uuid references public.profiles(id) on delete set null,
@@ -87,3 +87,6 @@ grant execute on function public.record_call(uuid,text,text,text,text,timestampt
 -- 最初の組織と管理者は、Supabase Authenticationでユーザー作成後に以下を実行します。
 -- insert into organizations(name) values ('OLTL') returning id;
 -- insert into profiles(id,organization_id,full_name,role) values ('AUTH_USER_UUID','ORG_UUID','辻 保','admin');
+
+-- 既にこのschema.sqlを実行済みの既存プロジェクトでは、emailカラムが無いため
+-- add-company-email-column.sql を別途実行してください（このファイルは新規プロジェクト用）。
