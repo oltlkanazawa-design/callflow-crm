@@ -1,6 +1,7 @@
 import { createClient, isDemoModeAllowed, isSupabaseConfigured } from "./supabase/client";
-import { demoCompanies, demoLogs } from "./demo-data";
-import type { CallLog, Company } from "./types";
+import { demoCompanies, demoLogs, demoMembers } from "./demo-data";
+import { memberErrorMessage, filterActivePendingInvitations } from "./members";
+import type { CallLog, Company, Member, MemberInvitation, MemberRole } from "./types";
 
 // Supabaseの技術的なエラーメッセージのうち、既知のパターンは営業担当にも分かる文言へ変換する
 function friendlyDbErrorMessage(error: { message?: string } | null | undefined, fallback: string): string {
@@ -13,30 +14,70 @@ function friendlyDbErrorMessage(error: { message?: string } | null | undefined, 
 
 const COMPANY_KEY = "callflow_companies_v1";
 const LOG_KEY = "callflow_logs_v1";
+const MEMBER_KEY = "callflow_members_v1";
 
 function readLocal<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
   try { return JSON.parse(localStorage.getItem(key) || "null") || fallback; } catch { return fallback; }
 }
 
-export async function loadCRMData(): Promise<{ companies: Company[]; logs: CallLog[]; members: string[]; currentUser: string }> {
+export interface CRMData {
+  companies: Company[];
+  logs: CallLog[];
+  activeMembers: Member[];
+  allMembers: Member[];
+  pendingInvitations: MemberInvitation[];
+  currentUserId: string;
+  currentUser: string;
+  isAdmin: boolean;
+}
+
+export async function loadCRMData(): Promise<CRMData> {
   if (!isSupabaseConfigured) {
     if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
-    return { companies: readLocal(COMPANY_KEY, demoCompanies), logs: readLocal(LOG_KEY, demoLogs), members: ["辻 保","山田 花子","佐藤 健","高橋 美咲"], currentUser:"辻 保" };
+    const members = readLocal(MEMBER_KEY, demoMembers);
+    const me = members[0];
+    return {
+      companies: readLocal(COMPANY_KEY, demoCompanies), logs: readLocal(LOG_KEY, demoLogs),
+      activeMembers: members.filter(m => m.active), allMembers: members, pendingInvitations: [],
+      currentUserId: me?.id || "", currentUser: me?.full_name || "辻 保", isAdmin: me?.role === "admin",
+    };
   }
   const supabase = createClient();
   const [{ data: companies, error: ce }, { data: logs, error: le }, { data: profiles, error: pe }, { data: auth }] = await Promise.all([
     supabase.from("companies").select("*, profiles!companies_owner_id_fkey(full_name)").order("created_at", { ascending: false }),
     supabase.from("call_logs").select("*, companies(name), profiles!call_logs_caller_id_fkey(full_name)").order("created_at", { ascending: false }).limit(500),
-    supabase.from("profiles").select("id,full_name").eq("active",true).order("full_name"),
+    supabase.from("profiles").select("id,full_name,email,role,active,created_at").order("full_name"),
     supabase.auth.getUser(),
   ]);
   if (ce || le || pe) throw ce || le || pe;
-  const currentUser=(profiles||[]).find(p=>p.id===auth.user?.id)?.full_name||"ログインユーザー";
+  const allMembers = (profiles || []) as Member[];
+  const me = allMembers.find(p => p.id === auth.user?.id);
+  const currentUser = me?.full_name || "ログインユーザー";
+  const isAdmin = me?.role === "admin" && me.active === true;
+
+  // 招待一覧はadminのみRLSで閲覧できる。admin以外は元々0件が返るため
+  // エラー扱いにしない。ただしテーブル未作成・RLS不整合等の本物のエラーは
+  // 空配列で隠さず、はっきり例外として投げる。
+  // 期限切れのpending招待（statusはまだ'pending'のまま）を「初回ログイン待ち」
+  // として誤表示しないよう、expires_atが現在時刻より後のものだけを取得する。
+  let pendingInvitations: MemberInvitation[] = [];
+  if (isAdmin) {
+    const { data: invitations, error: ie } = await supabase
+      .from("member_invitations")
+      .select("id,email,full_name,role,status,expires_at,created_at")
+      .eq("status", "pending")
+      .gt("expires_at", new Date().toISOString())
+      .order("created_at", { ascending: false });
+    if (ie) throw ie;
+    pendingInvitations = filterActivePendingInvitations((invitations || []) as MemberInvitation[]);
+  }
+
   return {
     companies: (companies || []).map((c: Record<string, unknown>) => ({ ...c, owner_name: (c.profiles as { full_name?: string } | null)?.full_name || "未割当" })) as Company[],
     logs: (logs || []).map((l: Record<string, unknown>) => ({ ...l, company_name: (l.companies as { name?: string } | null)?.name || "削除済み", caller_name: (l.profiles as { full_name?: string } | null)?.full_name || "不明" })) as CallLog[],
-    members:(profiles||[]).map(p=>p.full_name), currentUser,
+    activeMembers: allMembers.filter(m => m.active), allMembers, pendingInvitations,
+    currentUserId: auth.user?.id || "", currentUser, isAdmin,
   };
 }
 
@@ -133,4 +174,94 @@ export async function saveCallLog(log: CallLog, company: Company): Promise<void>
   const supabase = createClient();
   const { error } = await supabase.rpc("record_call",{p_company_id:company.id,p_result:log.result,p_note:log.note,p_transcript:log.transcript||null,p_ai_summary:log.ai_summary||null,p_next_action_at:log.next_action_at||null,p_heat:company.heat});
   if (error) throw error;
+}
+
+export async function inviteMember(email: string, fullName: string, role: MemberRole): Promise<Member | MemberInvitation> {
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const members = readLocal<Member[]>(MEMBER_KEY, demoMembers);
+    const normalizedEmail = email.trim().toLowerCase();
+    const name = fullName.trim();
+    if (!normalizedEmail) throw new Error(memberErrorMessage("email_required"));
+    if (!name) throw new Error(memberErrorMessage("full_name_required"));
+    const existing = members.find(m => m.email === normalizedEmail);
+    if (existing) throw new Error(memberErrorMessage(existing.active ? "already_active_member" : "inactive_member_use_reactivate"));
+    // デモモードには実際のGoogleログイン受け入れフローが無いため、招待＝即座に有効なメンバーとして追加する簡略動作とする
+    const member: Member = { id: crypto.randomUUID(), full_name: name, email: normalizedEmail, role, active: true, created_at: new Date().toISOString() };
+    localStorage.setItem(MEMBER_KEY, JSON.stringify([...members, member]));
+    return member;
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("create_member_invitation", { p_email: email, p_full_name: fullName, p_role: role });
+  if (error) throw new Error(memberErrorMessage(error.message));
+  return data as MemberInvitation;
+}
+
+export async function cancelInvitation(invitationId: string): Promise<void> {
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    return; // デモモードでは招待テーブルを使わないため何もしない
+  }
+  const supabase = createClient();
+  const { error } = await supabase.rpc("cancel_member_invitation", { invitation_id: invitationId });
+  if (error) throw new Error(memberErrorMessage(error.message));
+}
+
+export async function setMemberActive(memberId: string, active: boolean, currentUserId: string): Promise<Member> {
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    if (memberId === currentUserId) throw new Error(memberErrorMessage("cannot_change_own_active_status"));
+    const members = readLocal<Member[]>(MEMBER_KEY, demoMembers);
+    const target = members.find(m => m.id === memberId);
+    if (!target) throw new Error(memberErrorMessage("member_not_found_in_your_organization"));
+    if (!active && target.role === "admin" && target.active) {
+      const remainingAdmins = members.filter(m => m.role === "admin" && m.active && m.id !== memberId).length;
+      if (remainingAdmins === 0) throw new Error(memberErrorMessage("cannot_deactivate_last_admin"));
+    }
+    const updated = members.map(m => m.id === memberId ? { ...m, active } : m);
+    localStorage.setItem(MEMBER_KEY, JSON.stringify(updated));
+    return updated.find(m => m.id === memberId)!;
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("set_member_active", { member_id: memberId, new_active: active });
+  if (error) throw new Error(memberErrorMessage(error.message));
+  return data as Member;
+}
+
+export async function setMemberRole(memberId: string, role: MemberRole, currentUserId: string): Promise<Member> {
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    if (memberId === currentUserId) throw new Error(memberErrorMessage("cannot_change_own_role"));
+    const members = readLocal<Member[]>(MEMBER_KEY, demoMembers);
+    const target = members.find(m => m.id === memberId);
+    if (!target) throw new Error(memberErrorMessage("member_not_found_in_your_organization"));
+    if (role === "member" && target.role === "admin" && target.active) {
+      const remainingAdmins = members.filter(m => m.role === "admin" && m.active && m.id !== memberId).length;
+      if (remainingAdmins === 0) throw new Error(memberErrorMessage("cannot_demote_last_admin"));
+    }
+    const updated = members.map(m => m.id === memberId ? { ...m, role } : m);
+    localStorage.setItem(MEMBER_KEY, JSON.stringify(updated));
+    return updated.find(m => m.id === memberId)!;
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("set_member_role", { member_id: memberId, new_role: role });
+  if (error) throw new Error(memberErrorMessage(error.message));
+  return data as Member;
+}
+
+export async function updateMemberName(memberId: string, fullName: string): Promise<Member> {
+  const name = fullName.trim();
+  if (!name) throw new Error(memberErrorMessage("full_name_required"));
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const members = readLocal<Member[]>(MEMBER_KEY, demoMembers);
+    if (!members.find(m => m.id === memberId)) throw new Error(memberErrorMessage("member_not_found_in_your_organization"));
+    const updated = members.map(m => m.id === memberId ? { ...m, full_name: name } : m);
+    localStorage.setItem(MEMBER_KEY, JSON.stringify(updated));
+    return updated.find(m => m.id === memberId)!;
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("update_member_name", { member_id: memberId, new_full_name: name });
+  if (error) throw new Error(memberErrorMessage(error.message));
+  return data as Member;
 }

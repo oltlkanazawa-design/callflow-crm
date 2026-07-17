@@ -2,17 +2,21 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Building2, ChevronRight, ExternalLink, History, LayoutDashboard, LogOut, Menu, Phone, Plus, Search, Sparkles, Upload, Users, X } from "lucide-react";
-import { loadCRMData, saveCallLog, saveCompaniesBulk, saveCompany, updateCompany } from "@/lib/data";
+import { loadCRMData, saveCallLog, saveCompaniesBulk, saveCompany, updateCompany, inviteMember, cancelInvitation, setMemberActive, setMemberRole } from "@/lib/data";
 import { isSupabaseConfigured, createClient } from "@/lib/supabase/client";
-import type { CallLog, CallResult, Company, Heat, TranscriptAnalysis } from "@/lib/types";
+import type { CallLog, CallResult, Company, Heat, Member, MemberInvitation, MemberRole, TranscriptAnalysis } from "@/lib/types";
 import {
   autoDetectMapping, buildCompanyUpdatePatch, buildErrorReportCsv, buildRows, decodeCsvFile, detectDelimiter, parseCsvText,
   rowToCompanyDraft, summarizeRows, CANONICAL_FIELD_LABELS, CANONICAL_FIELD_ORDER, DUPLICATE_TIER_LABELS,
 } from "@/lib/csv-import";
 import type { CanonicalField, ColumnMapping, CsvRowResult, DuplicateMode } from "@/lib/csv-import";
+import {
+  filterCompaniesByMember, filterLogsByMember, activeMemberOptions, buildMemberListRows, readStoredViewFilter, writeStoredViewFilter,
+  resolveViewFilterMemberId, resolveCallIndex, computeTeamKpis,
+} from "@/lib/members";
+import type { MemberListRow } from "@/lib/members";
 
 type View = "dashboard" | "call" | "companies" | "history" | "team";
-const members = ["辻 保", "山田 花子", "佐藤 健", "高橋 美咲"];
 const results: { value: CallResult; label: string }[] = [
   { value:"アポ獲得", label:"◎ アポ獲得" }, { value:"資料送付", label:"▣ 資料送付" },
   { value:"再架電", label:"↻ 再架電" }, { value:"担当者不在", label:"◷ 担当者不在" },
@@ -31,8 +35,14 @@ export default function CallFlowApp() {
   const [logs,setLogs] = useState<CallLog[]>([]);
   const [loading,setLoading] = useState(true);
   const [callIndex,setCallIndex] = useState(0);
-  const [member,setMember] = useState("辻 保");
-  const [teamMembers,setTeamMembers] = useState(members);
+  // currentUserId/currentUserName は書き込み専用（架電記録・企業登録の担当者）。編集不可。
+  const [currentUserId,setCurrentUserId] = useState("");
+  const [currentUserName,setCurrentUserName] = useState("ログインユーザー");
+  const [isAdmin,setIsAdmin] = useState(false);
+  const [allMembers,setAllMembers] = useState<Member[]>([]);
+  const [pendingInvitations,setPendingInvitations] = useState<MemberInvitation[]>([]);
+  // viewFilterMemberId は表示・集計の絞り込み専用（なりすまし防止のため書き込みには使わない）
+  const [viewFilterMemberId,setViewFilterMemberId] = useState<string>(()=>readStoredViewFilter());
   const [menu,setMenu] = useState(false);
   const [companyModal,setCompanyModal] = useState(false);
   const [importModal,setImportModal] = useState(false);
@@ -40,11 +50,33 @@ export default function CallFlowApp() {
   const [aiModal,setAiModal] = useState(false);
   const [toast,setToast] = useState("");
 
+  useEffect(()=>{writeStoredViewFilter(viewFilterMemberId)},[viewFilterMemberId]);
+
   const notify=(message:string)=>{setToast(message);setTimeout(()=>setToast(""),2600)};
-  const refresh = async () => { try { const data=await loadCRMData(); setCompanies(data.companies); setLogs(data.logs);setTeamMembers(data.members);setMember(data.currentUser); } catch(e) { notify(e instanceof Error?e.message:"データの取得に失敗しました"); } finally { setLoading(false); } };
-  useEffect(()=>{let active=true;loadCRMData().then(data=>{if(active){setCompanies(data.companies);setLogs(data.logs);setTeamMembers(data.members);setMember(data.currentUser)}}).catch(e=>{if(active)setToast(e instanceof Error?e.message:"データの取得に失敗しました")}).finally(()=>{if(active)setLoading(false)});return()=>{active=false}},[]);
+  const applyData=(data:Awaited<ReturnType<typeof loadCRMData>>)=>{setCompanies(data.companies);setLogs(data.logs);setAllMembers(data.allMembers);setPendingInvitations(data.pendingInvitations);setCurrentUserId(data.currentUserId);setCurrentUserName(data.currentUser);setIsAdmin(data.isAdmin)};
+  const refresh = async () => { try { applyData(await loadCRMData()); } catch(e) { notify(e instanceof Error?e.message:"データの取得に失敗しました"); } finally { setLoading(false); } };
+  useEffect(()=>{let active=true;loadCRMData().then(data=>{if(active)applyData(data)}).catch(e=>{if(active)setToast(e instanceof Error?e.message:"データの取得に失敗しました")}).finally(()=>{if(active)setLoading(false)});return()=>{active=false}},[]);
   const go=(next:View)=>{setView(next);setMenu(false)};
-  const callCompany=(company:Company)=>{setCallIndex(Math.max(0,companies.findIndex(c=>c.id===company.id)));go("call")};
+  const filteredCompanies=useMemo(()=>filterCompaniesByMember(companies,viewFilterMemberId),[companies,viewFilterMemberId]);
+  const filteredLogs=useMemo(()=>filterLogsByMember(logs,viewFilterMemberId),[logs,viewFilterMemberId]);
+
+  // 保存済みの担当者フィルターが、メンバー一覧の取得後に無効（存在しない／利用停止済み）と
+  // 判明した場合は"all"へ戻す（Reactの「レンダー中に状態を調整する」パターン。
+  // allMembers読み込み前の空配列で誤って"all"に戻さないようlength>0の間だけ判定する）。
+  if(allMembers.length>0){
+    const resolved=resolveViewFilterMemberId(viewFilterMemberId,activeMemberOptions(allMembers));
+    if(resolved!==viewFilterMemberId)setViewFilterMemberId(resolved);
+  }
+
+  // 担当者フィルターが変わったら架電対象のインデックスを0へ戻す。
+  // 件数が変わってcallIndexが範囲外になった場合も0へ補正する（同じくレンダー中に調整）。
+  const [prevViewFilterMemberId,setPrevViewFilterMemberId]=useState(viewFilterMemberId);
+  const filterChanged=viewFilterMemberId!==prevViewFilterMemberId;
+  if(filterChanged)setPrevViewFilterMemberId(viewFilterMemberId);
+  const resolvedCallIndex=resolveCallIndex({filterChanged,callIndex,filteredCompaniesLength:filteredCompanies.length});
+  if(resolvedCallIndex!==callIndex)setCallIndex(resolvedCallIndex);
+
+  const callCompany=(company:Company)=>{setCallIndex(Math.max(0,filteredCompanies.findIndex(c=>c.id===company.id)));go("call")};
   const logout=async()=>{if(isSupabaseConfigured)await createClient().auth.signOut();location.href="/login"};
 
   return <div className="min-h-screen bg-[#f5f7fb] text-[#172036]">
@@ -52,24 +84,24 @@ export default function CallFlowApp() {
       <div className="mb-8 flex items-center gap-2.5 px-2 text-xl font-extrabold"><span className="grid size-8 place-items-center rounded-[9px] bg-gradient-to-br from-blue-400 to-violet-600 text-xs">CF</span><span>CallFlow<small className="block text-[8px] tracking-[1.7px] text-slate-500">TELESALES CRM</small></span></div>
       <Nav view={view} go={go}/>
       <div className="absolute bottom-5 left-[18px] right-[18px] border-t border-slate-700 pt-4">
-        <div className="flex items-center gap-2.5"><div className="grid size-9 place-items-center rounded-full bg-blue-500 text-xs font-bold">辻</div><div className="min-w-0 flex-1"><b className="block text-xs">辻 保</b><span className="text-[10px] text-slate-500">管理者</span></div><button onClick={logout} aria-label="ログアウト"><LogOut size={15} className="text-slate-500"/></button></div>
+        <div className="flex items-center gap-2.5"><div className="grid size-9 place-items-center rounded-full bg-blue-500 text-xs font-bold">{currentUserName.slice(0,1)}</div><div className="min-w-0 flex-1"><b className="block truncate text-xs">{currentUserName}</b><span className="text-[10px] text-slate-500">{isAdmin?"管理者":"一般メンバー"}</span></div><button onClick={logout} aria-label="ログアウト"><LogOut size={15} className="text-slate-500"/></button></div>
       </div>
     </aside>
     {menu&&<button className="fixed inset-0 z-30 bg-slate-950/50 lg:hidden" onClick={()=>setMenu(false)} aria-label="メニューを閉じる"/>}
     <main className="min-h-screen lg:ml-[238px]">
-      <header className="flex min-h-[76px] items-center justify-between gap-3 px-4 md:px-8"><div className="flex items-center gap-3"><button className="lg:hidden" onClick={()=>setMenu(true)}><Menu/></button><div><h1 className="text-xl font-extrabold tracking-tight md:text-2xl">{meta[view][0]}</h1><p className="mt-1 hidden text-xs text-slate-500 sm:block">{meta[view][1]}</p></div></div><div className="flex gap-2"><select disabled={isSupabaseConfigured} className="input hidden !w-auto disabled:bg-slate-50 md:block" value={member} onChange={e=>setMember(e.target.value)}>{teamMembers.map(m=><option key={m}>{m}</option>)}</select><button className="btn btn-ai" onClick={()=>setAiModal(true)}><Sparkles size={15}/><span className="hidden sm:inline">文字起こし解析</span></button></div></header>
+      <header className="flex min-h-[76px] items-center justify-between gap-3 px-4 md:px-8"><div className="flex items-center gap-3"><button className="lg:hidden" onClick={()=>setMenu(true)}><Menu/></button><div><h1 className="text-xl font-extrabold tracking-tight md:text-2xl">{meta[view][0]}</h1><p className="mt-1 hidden text-xs text-slate-500 sm:block">{meta[view][1]}</p></div></div><div className="flex gap-2"><select className="input hidden !w-auto md:block" value={viewFilterMemberId} onChange={e=>setViewFilterMemberId(e.target.value)} aria-label="担当者で絞り込み"><option value="all">全員</option>{activeMemberOptions(allMembers).map(m=><option key={m.id} value={m.id}>{m.full_name}</option>)}</select><button className="btn btn-ai" onClick={()=>setAiModal(true)}><Sparkles size={15}/><span className="hidden sm:inline">文字起こし解析</span></button></div></header>
       <div className="px-4 pb-10 md:px-8">{loading?<Loading/>:<>
-        {view==="dashboard"&&<Dashboard companies={companies} logs={logs} go={go}/>} 
-        {view==="companies"&&<Companies companies={companies} callCompany={callCompany} add={()=>setCompanyModal(true)} bulkImport={()=>setImportModal(true)} csvImport={()=>setCsvModal(true)}/>}
-        {view==="call"&&<CallScreen company={companies[callIndex]} member={member} next={()=>setCallIndex(i=>(i+1)%companies.length)} onSaved={refresh} notify={notify}/>} 
-        {view==="history"&&<HistoryView logs={logs}/>} 
-        {view==="team"&&<Team logs={logs} members={teamMembers}/>} 
+        {view==="dashboard"&&<Dashboard companies={filteredCompanies} logs={filteredLogs} go={go}/>}
+        {view==="companies"&&<Companies companies={filteredCompanies} callCompany={callCompany} add={()=>setCompanyModal(true)} bulkImport={()=>setImportModal(true)} csvImport={()=>setCsvModal(true)}/>}
+        {view==="call"&&<CallScreen company={filteredCompanies[callIndex]} member={currentUserName} next={()=>setCallIndex(i=>filteredCompanies.length?(i+1)%filteredCompanies.length:0)} onSaved={refresh} notify={notify}/>}
+        {view==="history"&&<HistoryView logs={filteredLogs}/>}
+        {view==="team"&&<Team logs={filteredLogs} allMembers={allMembers} pendingInvitations={pendingInvitations} viewFilterMemberId={viewFilterMemberId} currentUserId={currentUserId} isAdmin={isAdmin} notify={notify} refresh={refresh}/>}
       </>}</div>
     </main>
-    {companyModal&&<CompanyModal member={member} close={()=>setCompanyModal(false)} saved={async c=>{setCompanies(x=>[c,...x]);setCompanyModal(false);notify("企業を登録しました")}}/>}
-    {importModal&&<LeadImportModal member={member} existing={companies} close={()=>setImportModal(false)} saved={async added=>{await refresh();setImportModal(false);notify(`${added}件の営業先を取り込みました`)}}/>}
-    {csvModal&&<CsvImportModal member={member} existing={companies} close={()=>setCsvModal(false)} saved={async summary=>{await refresh();setCsvModal(false);notify(`新規${summary.newCount}件・更新${summary.updatedCount}件を登録しました（スキップ${summary.skippedCount}件・エラー${summary.errorCount}件）`)}}/>}
-    {aiModal&&<TranscriptModal company={companies[callIndex]} close={()=>setAiModal(false)} onApply={(a,transcript)=>{sessionStorage.setItem("callflow_analysis",JSON.stringify({...a,transcript}));setAiModal(false);go("call");notify("解析結果を架電記録へ反映しました")}}/>}
+    {companyModal&&<CompanyModal member={currentUserName} close={()=>setCompanyModal(false)} saved={async c=>{setCompanies(x=>[c,...x]);setCompanyModal(false);notify("企業を登録しました")}}/>}
+    {importModal&&<LeadImportModal member={currentUserName} existing={companies} close={()=>setImportModal(false)} saved={async added=>{await refresh();setImportModal(false);notify(`${added}件の営業先を取り込みました`)}}/>}
+    {csvModal&&<CsvImportModal member={currentUserName} existing={companies} close={()=>setCsvModal(false)} saved={async summary=>{await refresh();setCsvModal(false);notify(`新規${summary.newCount}件・更新${summary.updatedCount}件を登録しました（スキップ${summary.skippedCount}件・エラー${summary.errorCount}件）`)}}/>}
+    {aiModal&&<TranscriptModal company={filteredCompanies[callIndex]} close={()=>setAiModal(false)} onApply={(a,transcript)=>{sessionStorage.setItem("callflow_analysis",JSON.stringify({...a,transcript}));setAiModal(false);go("call");notify("解析結果を架電記録へ反映しました")}}/>}
     {toast&&<div className="fixed bottom-6 right-6 z-[70] rounded-xl bg-[#152039] px-5 py-3 text-sm font-semibold text-white shadow-2xl">{toast}</div>}
     {!isSupabaseConfigured&&<div className="fixed bottom-3 left-3 z-20 rounded-full bg-amber-100 px-3 py-1 text-[10px] font-bold text-amber-800 lg:left-[250px]">デモモード</div>}
   </div>;
@@ -105,7 +137,62 @@ function parseLeadRows(raw:string, member:string, existing:Company[], defaults:{
 function PreCallChecklist({company}:{company:Company}){return <div className="rounded-xl border border-blue-100 bg-blue-50/70 p-4"><b className="block text-xs text-blue-700">架電前チェック</b><div className="mt-2 grid gap-2 text-[11px] text-slate-600 sm:grid-cols-3"><span>1. 公式URLで事業内容を確認</span><span>2. 採用・ニュース欄を見る</span><span>3. 担当者名と前回メモを確認</span></div><p className="mt-2 text-[10px] text-slate-500">取得元：{company.list_source||"未設定"}{company.website_url?" ／ URL登録済み":" ／ 公式URL未登録"}</p></div>}
 
 function HistoryView({logs}:{logs:CallLog[]}) {const [q,setQ]=useState("");const [f,setF]=useState("");const shown=logs.filter(l=>(l.company_name+l.note).toLowerCase().includes(q.toLowerCase())&&(!f||l.result===f));return <div><div className="mb-3 flex gap-2"><div className="relative flex-1 md:max-w-sm"><Search className="absolute left-3 top-2.5 size-4 text-slate-400"/><input className="input pl-9" value={q} onChange={e=>setQ(e.target.value)} placeholder="企業名・内容で検索"/></div><select className="input !w-auto" value={f} onChange={e=>setF(e.target.value)}><option value="">すべての結果</option>{results.slice(0,5).map(r=><option key={r.value}>{r.value}</option>)}</select></div><div className="card overflow-x-auto"><table className="w-full min-w-[850px]"><thead><tr className="bg-slate-50 text-left text-[10px] text-slate-500">{["日時","企業名","結果","担当","会話メモ・AI要約","次回対応"].map(x=><th key={x} className="border-b border-slate-200 p-3">{x}</th>)}</tr></thead><tbody>{shown.map(l=><tr className="text-xs" key={l.id}><td className="border-b border-slate-100 p-4">{fmt(l.created_at,true)}</td><td className="border-b border-slate-100 p-4 font-bold">{l.company_name}</td><td className="border-b border-slate-100 p-4"><span className={`badge ${badge(l.result)}`}>{l.result}</span></td><td className="border-b border-slate-100 p-4">{l.caller_name}</td><td className="max-w-[360px] border-b border-slate-100 p-4">{l.ai_summary||l.note}</td><td className="border-b border-slate-100 p-4">{fmt(l.next_action_at,true)}</td></tr>)}</tbody></table></div></div>}
-function Team({logs,members}:{logs:CallLog[];members:string[]}) {const data=useMemo(()=>members.map(name=>{const own=logs.filter(l=>l.caller_name===name);return {name,calls:own.length,appt:own.filter(l=>l.result==="アポ獲得").length}}).sort((a,b)=>b.calls-a.calls),[logs,members]);const connection=logs.length?Math.round(logs.filter(l=>l.result!=="担当者不在").length/logs.length*100):0;return <div><div className="grid grid-cols-2 gap-3 md:grid-cols-3"><Kpi l="チーム架電数" v={logs.length}/><Kpi l="チームアポ数" v={logs.filter(l=>l.result==="アポ獲得").length}/><Kpi l="平均接続率" v={`${connection}%`}/></div><div className="card mt-4"><CardHead title="メンバー実績" sub="直近500件"/><div className="p-5">{data.map((r,i)=><div key={r.name} className="grid grid-cols-[30px_1fr_65px_65px] items-center gap-3 border-b border-slate-100 py-3"><b className={i===0?"text-amber-500":"text-slate-400"}>{i+1}</b><div><b className="text-xs">{r.name}</b><div className="mt-1.5 h-1.5 overflow-hidden rounded bg-slate-100"><i className="block h-full rounded bg-blue-600" style={{width:`${Math.max(8,r.calls/Math.max(1,data[0]?.calls||1)*100)}%`}}/></div></div><p className="text-right text-sm font-bold">{r.calls}<small className="block text-[9px] font-normal text-slate-500">架電</small></p><p className="text-right text-sm font-bold">{r.appt}<small className="block text-[9px] font-normal text-slate-500">アポ</small></p></div>)}</div></div></div>}
+function Team({logs,allMembers,pendingInvitations,viewFilterMemberId,currentUserId,isAdmin,notify,refresh}:{logs:CallLog[];allMembers:Member[];pendingInvitations:MemberInvitation[];viewFilterMemberId:string;currentUserId:string;isAdmin:boolean;notify:(s:string)=>void;refresh:()=>Promise<void>}) {
+ // メンバー実績ランキングは「絞り込み」の対象（過去の実績は利用停止メンバーも保持するためallMembersを母集団にする）
+ const rankedMembers=useMemo(()=>viewFilterMemberId==="all"?allMembers:allMembers.filter(m=>m.id===viewFilterMemberId),[allMembers,viewFilterMemberId]);
+ const data=useMemo(()=>rankedMembers.map(m=>{const own=logs.filter(l=>l.caller_id===m.id);return {id:m.id,name:m.full_name,active:m.active,calls:own.length,appt:own.filter(l=>l.result==="アポ獲得").length}}).sort((a,b)=>b.calls-a.calls),[rankedMembers,logs]);
+ // logsは呼び出し元（CallFlowApp）で担当者フィルター済み。"全員"ならチーム全体、
+ // 特定担当者ならその人だけの数値になる
+ const kpis=useMemo(()=>computeTeamKpis(logs),[logs]);
+ const [inviteModal,setInviteModal]=useState(false);
+ return <div>
+  <div className="grid grid-cols-2 gap-3 md:grid-cols-3"><Kpi l="チーム架電数" v={kpis.totalCalls}/><Kpi l="チームアポ数" v={kpis.totalAppointments}/><Kpi l="平均接続率" v={`${kpis.connectionRate}%`}/></div>
+  <div className="card mt-4"><CardHead title="メンバー実績" sub="直近500件"/><div className="p-5">{data.map((r,i)=><div key={r.id} className="grid grid-cols-[30px_1fr_65px_65px] items-center gap-3 border-b border-slate-100 py-3 last:border-0"><b className={i===0?"text-amber-500":"text-slate-400"}>{i+1}</b><div><b className="text-xs">{r.name}{!r.active&&<span className="ml-1.5 rounded bg-slate-100 px-1.5 py-0.5 text-[9px] font-bold text-slate-500">利用停止</span>}</b><div className="mt-1.5 h-1.5 overflow-hidden rounded bg-slate-100"><i className="block h-full rounded bg-blue-600" style={{width:`${Math.max(8,r.calls/Math.max(1,data[0]?.calls||1)*100)}%`}}/></div></div><p className="text-right text-sm font-bold">{r.calls}<small className="block text-[9px] font-normal text-slate-500">架電</small></p><p className="text-right text-sm font-bold">{r.appt}<small className="block text-[9px] font-normal text-slate-500">アポ</small></p></div>)}{!data.length&&<p className="p-8 text-center text-xs text-slate-500">該当するメンバーがいません</p>}</div></div>
+  {isAdmin&&<div className="card mt-4">
+   <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><h2 className="text-sm font-extrabold">メンバー管理</h2><button className="btn btn-primary !py-1.5 text-xs" onClick={()=>setInviteModal(true)}><Plus size={14}/>メンバーを追加</button></div>
+   <MemberManagementList allMembers={allMembers} pendingInvitations={pendingInvitations} currentUserId={currentUserId} notify={notify} refresh={refresh}/>
+  </div>}
+  {inviteModal&&<InviteMemberModal close={()=>setInviteModal(false)} saved={async()=>{await refresh();setInviteModal(false);notify("招待を作成しました。対象者がGoogleで初回ログインすると参加します")}} notify={notify}/>}
+ </div>
+}
+
+function MemberManagementList({allMembers,pendingInvitations,currentUserId,notify,refresh}:{allMembers:Member[];pendingInvitations:MemberInvitation[];currentUserId:string;notify:(s:string)=>void;refresh:()=>Promise<void>}) {
+ const rows=useMemo(()=>buildMemberListRows(allMembers,pendingInvitations),[allMembers,pendingInvitations]);
+ const [busyId,setBusyId]=useState("");
+ const statusLabel=(s:MemberListRow["status"])=>s==="invited"?"初回ログイン待ち":s==="active"?"有効":"利用停止";
+ const statusTone=(s:MemberListRow["status"])=>s==="invited"?"bg-amber-50 text-amber-700":s==="active"?"bg-emerald-50 text-emerald-700":"bg-slate-100 text-slate-600";
+ const run=async(id:string,action:()=>Promise<unknown>,successMessage:string)=>{setBusyId(id);try{await action();await refresh();notify(successMessage)}catch(e){notify(e instanceof Error?e.message:"操作に失敗しました")}finally{setBusyId("")}};
+ return <div className="p-2">
+  {rows.map(r=><div key={`${r.kind}-${r.id}`} className="flex flex-wrap items-center gap-3 border-b border-slate-100 p-3 text-xs last:border-0">
+   <div className="min-w-[160px] flex-1"><b className="block">{r.full_name}</b><span className="text-[10px] text-slate-500">{r.email||"—"}</span></div>
+   <span className="badge bg-slate-100 text-slate-600">{r.role==="admin"?"管理者":"一般メンバー"}</span>
+   <span className={`badge ${statusTone(r.status)}`}>{statusLabel(r.status)}</span>
+   <span className="w-24 text-[10px] text-slate-400">{r.created_at?fmt(r.created_at):""}</span>
+   <div className="flex flex-wrap gap-1.5">
+    {r.kind==="invitation"&&<button disabled={busyId===r.id} className="btn btn-light !py-1 text-[11px]" onClick={()=>run(r.id,()=>cancelInvitation(r.id),"招待を取り消しました")}>招待キャンセル</button>}
+    {r.kind==="member"&&r.id!==currentUserId&&<>
+     {r.status==="active"
+      ?<button disabled={busyId===r.id} className="btn btn-light !py-1 text-[11px]" onClick={()=>run(r.id,()=>setMemberActive(r.id,false,currentUserId),"利用停止にしました")}>利用停止</button>
+      :<button disabled={busyId===r.id} className="btn btn-light !py-1 text-[11px]" onClick={()=>run(r.id,()=>setMemberActive(r.id,true,currentUserId),"再有効化しました")}>再有効化</button>}
+     <button disabled={busyId===r.id} className="btn btn-light !py-1 text-[11px]" onClick={()=>run(r.id,()=>setMemberRole(r.id,r.role==="admin"?"member":"admin",currentUserId),"権限を変更しました")}>{r.role==="admin"?"一般メンバーにする":"管理者にする"}</button>
+    </>}
+    {r.kind==="member"&&r.id===currentUserId&&<span className="text-[10px] text-slate-400">自分自身は変更できません</span>}
+   </div>
+  </div>)}
+  {!rows.length&&<p className="p-8 text-center text-xs text-slate-500">メンバーがいません</p>}
+ </div>
+}
+
+function InviteMemberModal({close,saved,notify}:{close:()=>void;saved:()=>void;notify:(s:string)=>void}) {
+ const [email,setEmail]=useState("");const [fullName,setFullName]=useState("");const [role,setRole]=useState<MemberRole>("member");const [busy,setBusy]=useState(false);
+ const submit=async()=>{if(!email.trim()||!fullName.trim())return;setBusy(true);try{await inviteMember(email,fullName,role);saved()}catch(e){notify(e instanceof Error?e.message:"招待の作成に失敗しました")}finally{setBusy(false)}};
+ return <Modal title="メンバーを追加" sub="対象者がこのメールアドレスのGoogleアカウントで初回ログインすると、自動的に組織へ参加します" close={close}>
+  <Field l="氏名" v={fullName} set={setFullName}/>
+  <Field l="メールアドレス" v={email} set={setEmail}/>
+  <Label text="権限"><select className="input" value={role} onChange={e=>setRole(e.target.value as MemberRole)}><option value="member">一般メンバー</option><option value="admin">管理者</option></select></Label>
+  <button disabled={busy||!email.trim()||!fullName.trim()} onClick={submit} className="btn btn-primary w-full disabled:opacity-50">{busy?"招待を作成中…":"招待を作成する"}</button>
+ </Modal>
+}
 function Kpi({l,v}:{l:string;v:string|number}){return <div className="card p-4"><small className="font-bold text-slate-500">{l}</small><p className="mt-2 text-3xl font-extrabold">{v}</p></div>}
 
 function Modal({title,sub,close,children}:{title:string;sub?:string;close:()=>void;children:React.ReactNode}) {return <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/50 p-3" onMouseDown={e=>{if(e.target===e.currentTarget)close()}}><div className="max-h-[94vh] w-full max-w-[680px] overflow-auto rounded-2xl bg-white shadow-2xl"><div className="flex items-start justify-between border-b border-slate-100 p-5"><div><h2 className="font-extrabold">{title}</h2>{sub&&<p className="mt-1 text-[10px] text-slate-500">{sub}</p>}</div><button onClick={close}><X className="size-5 text-slate-400"/></button></div><div className="p-5">{children}</div></div></div>}

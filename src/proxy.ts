@@ -11,7 +11,9 @@ export async function proxy(request: NextRequest) {
   const {data:{user}}=await supabase.auth.getUser();
   const path=request.nextUrl.pathname;
   if(!user&&path.startsWith("/dashboard"))return NextResponse.redirect(new URL("/login",request.url));
-  if(user&&path==="/login")return NextResponse.redirect(new URL("/dashboard",request.url));
+  // ?error=付きの/loginは、招待なし・利用停止等の理由でauth/callbackが戻してきた画面のため、
+  // セッションが残っていても/dashboardへ強制リダイレクトせずメッセージを表示させる
+  if(user&&path==="/login"&&!request.nextUrl.searchParams.has("error"))return NextResponse.redirect(new URL("/dashboard",request.url));
   return response;
 }
 
