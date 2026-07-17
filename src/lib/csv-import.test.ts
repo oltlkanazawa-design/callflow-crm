@@ -57,6 +57,69 @@ test("autoDetectMapping: 未知の列はマッピングされない", () => {
   assert.equal(mapping[1], "");
 });
 
+// --- fix/csv-header-mapping: name/website_url/locationの素の英語ヘッダーが
+//     未認識だった不具合（企業名が未入力です50件、登録可能0件）の回帰テスト ---
+
+test("autoDetectMapping: 'name'ヘッダーが企業名として認識される", () => {
+  const mapping = autoDetectMapping(["name", "phone", "website_url", "location", "industry", "contact_name", "email", "memo", "list_source"]);
+  assert.deepEqual(mapping, { 0: "name", 1: "phone", 2: "website_url", 3: "location", 4: "industry", 5: "contact_name", 6: "email", 7: "memo", 8: "list_source" });
+});
+
+test("autoDetectMapping: 'company_name'ヘッダーが企業名として認識される", () => {
+  const mapping = autoDetectMapping(["company_name"]);
+  assert.equal(mapping[0], "name");
+});
+
+test("autoDetectMapping: 'website_url'ヘッダーがURLとして認識される", () => {
+  const mapping = autoDetectMapping(["website_url"]);
+  assert.equal(mapping[0], "website_url");
+});
+
+test("autoDetectMapping: 'location'ヘッダーが所在地として認識される", () => {
+  const mapping = autoDetectMapping(["location"]);
+  assert.equal(mapping[0], "location");
+});
+
+test("autoDetectMapping: BOM付きの'name'ヘッダーを認識する", () => {
+  const mapping = autoDetectMapping(["﻿name", "phone"]);
+  assert.equal(mapping[0], "name");
+  assert.equal(mapping[1], "phone");
+});
+
+test("autoDetectMapping: 前後の空白・大文字小文字を正規化して認識する", () => {
+  const mapping = autoDetectMapping(["  Name  ", " WEBSITE_URL ", "Location"]);
+  assert.equal(mapping[0], "name");
+  assert.equal(mapping[1], "website_url");
+  assert.equal(mapping[2], "location");
+});
+
+test("autoDetectMapping: ハイフンとアンダースコアの表記差を吸収する", () => {
+  const mapping = autoDetectMapping(["company-name", "website-url", "phone_number", "campaign-name"]);
+  assert.equal(mapping[0], "name");
+  assert.equal(mapping[1], "website_url");
+  assert.equal(mapping[2], "phone");
+  assert.equal(mapping[3], "list_source");
+});
+
+test("再現テスト: 実際の不具合CSVヘッダー（name/phone/website_url/location/industry/contact_name/email/memo/list_source）を50行とも正しく登録可能と判定する", () => {
+  const header = "企業名,電話番号,URL,所在地,業種,担当者名,メールアドレス,メモ,リスト名"; // 表示用（実ヘッダーは英語）
+  const englishHeader = ["name", "phone", "website_url", "location", "industry", "contact_name", "email", "memo", "list_source"];
+  const lines = [englishHeader.join(",")];
+  for (let i = 0; i < 50; i++) {
+    lines.push(`回帰テスト企業${i},076-${String(1000 + i).padStart(4, "0")}-0000,https://example${i}.com,石川県金沢市,IT,担当${i},user${i}@example.com,メモ${i},リスト`);
+  }
+  const csv = "﻿" + lines.join("\r\n") + "\r\n";
+  const table = parseCsvText(csv, detectDelimiter(csv));
+  const mapping = autoDetectMapping(table[0]);
+  assert.deepEqual(mapping, { 0: "name", 1: "phone", 2: "website_url", 3: "location", 4: "industry", 5: "contact_name", 6: "email", 7: "memo", 8: "list_source" });
+  const rows = buildRows(table.slice(1), mapping, []);
+  const summary = summarizeRows(table[0], mapping, rows);
+  assert.equal(summary.total, 50);
+  assert.equal(summary.validCount, 50);
+  assert.equal(summary.missingRequiredCount, 0);
+  void header;
+});
+
 test("normalizePhone: ハイフン・全角数字を除去して比較用の数字列にする", () => {
   assert.equal(normalizePhone("076-123-4567"), "0761234567");
   assert.equal(normalizePhone("０７６－１２３－４５６７"), "0761234567");

@@ -15,15 +15,15 @@ export const DUPLICATE_TIER_LABELS: Record<DuplicateTier, string> = {
 };
 
 const HEADER_ALIASES: Record<CanonicalField, string[]> = {
-  name: ["企業名", "会社名", "法人名", "company", "companyname", "company_name"],
-  phone: ["電話番号", "電話", "tel", "phone"],
-  website_url: ["url", "公式url", "公式サイト", "webサイト", "ウェブサイト", "website"],
-  location: ["所在地", "住所", "address"],
+  name: ["企業名", "会社名", "法人名", "company", "companyname", "company_name", "name"],
+  phone: ["電話番号", "電話", "tel", "phone", "phone_number"],
+  website_url: ["url", "公式url", "公式サイト", "webサイト", "ウェブサイト", "website", "website_url", "official_url", "ホームページ"],
+  location: ["所在地", "住所", "address", "location"],
   industry: ["業種", "industry"],
   contact_name: ["担当者", "担当者名", "contact", "contactname", "contact_name"],
-  email: ["メール", "メールアドレス", "email"],
+  email: ["メール", "メールアドレス", "email", "mail"],
   memo: ["メモ", "備考", "memo", "note", "notes"],
-  list_source: ["リスト名", "キャンペーン名", "list", "campaign", "list_source"],
+  list_source: ["リスト名", "キャンペーン名", "list", "campaign", "list_source", "campaign_name"],
 };
 
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -101,7 +101,12 @@ export function parseCsvText(text: string, delimiter: "," | "\t" = ","): string[
 }
 
 function normalizeHeader(h: string): string {
-  return h.trim().toLowerCase().replace(/[\s　]+/g, "");
+  // 先頭のBOM・前後の空白・大文字小文字・全角空白・ハイフン/アンダースコアの表記差を吸収する
+  return h
+    .replace(/^﻿/, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s　_-]+/g, "");
 }
 
 export function autoDetectMapping(headers: string[]): ColumnMapping {
