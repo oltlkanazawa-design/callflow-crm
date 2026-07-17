@@ -303,6 +303,20 @@ grant execute on function public.cancel_member_invitation(uuid) to authenticated
 
 -- ---------------------------------------------------------
 -- 5. 招待受け入れRPC（Googleログイン直後にコールバックから呼ぶ）
+--
+-- 【二重実行の再現テスト計画（実Supabase接続が必要・未実施）】
+-- 1. pendingの招待を1件作成する
+-- 2. 対象メールでGoogleログインし、認可コードを取得する
+-- 3. 同じ認可コードでのセッション確立後、accept_pending_invitation()を
+--    2つのDBセッションからほぼ同時に（例: pg_sleepで意図的に競合させる、
+--    もしくはNext.jsのauth/callbackへ同時に2リクエストを送る）呼び出す
+-- 4. 期待結果：
+--    - 一方は新規profileを作成しinvitationをacceptedへ更新して正常終了する
+--    - もう一方はno_pending_invitationを投げず、1で作成されたprofileを
+--      正常なレスポンスとして返す（例外にならない）
+--    - profilesに重複行が作られない（idがauth.uid()のためPKで保証されるが、
+--      2回ともinsertを試みて片方が一意制約違反にならないことも確認する）
+--    - member_invitationsのstatusが'accepted'のまま1回しか更新されない
 -- ---------------------------------------------------------
 create or replace function public.accept_pending_invitation()
 returns public.profiles
@@ -351,6 +365,21 @@ begin
     for update;
 
   if not found then
+    -- 有効なpending招待が見つからない場合でも即座に拒否しない。
+    -- 同一OAuthコールバックがほぼ同時に2回実行された競合により、
+    -- 並行して走っていたもう一方の実行が既にprofileを作成・招待をaccepted済みの
+    -- 可能性があるため、profilesを再度取得してから最終判断する（冪等性のため）。
+    select * into v_profile from public.profiles where id = v_uid;
+    if found then
+      if v_profile.active = true then
+        if v_profile.email is distinct from v_email then
+          update public.profiles set email = v_email where id = v_uid returning * into v_profile;
+        end if;
+        return v_profile;
+      else
+        raise exception 'account_inactive';
+      end if;
+    end if;
     raise exception 'no_pending_invitation';
   end if;
 

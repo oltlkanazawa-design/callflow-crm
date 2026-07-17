@@ -10,7 +10,10 @@ import {
   rowToCompanyDraft, summarizeRows, CANONICAL_FIELD_LABELS, CANONICAL_FIELD_ORDER, DUPLICATE_TIER_LABELS,
 } from "@/lib/csv-import";
 import type { CanonicalField, ColumnMapping, CsvRowResult, DuplicateMode } from "@/lib/csv-import";
-import { filterCompaniesByMember, filterLogsByMember, activeMemberOptions, buildMemberListRows, readStoredViewFilter, writeStoredViewFilter } from "@/lib/members";
+import {
+  filterCompaniesByMember, filterLogsByMember, activeMemberOptions, buildMemberListRows, readStoredViewFilter, writeStoredViewFilter,
+  resolveViewFilterMemberId, resolveCallIndex, computeTeamKpis,
+} from "@/lib/members";
 import type { MemberListRow } from "@/lib/members";
 
 type View = "dashboard" | "call" | "companies" | "history" | "team";
@@ -56,6 +59,23 @@ export default function CallFlowApp() {
   const go=(next:View)=>{setView(next);setMenu(false)};
   const filteredCompanies=useMemo(()=>filterCompaniesByMember(companies,viewFilterMemberId),[companies,viewFilterMemberId]);
   const filteredLogs=useMemo(()=>filterLogsByMember(logs,viewFilterMemberId),[logs,viewFilterMemberId]);
+
+  // 保存済みの担当者フィルターが、メンバー一覧の取得後に無効（存在しない／利用停止済み）と
+  // 判明した場合は"all"へ戻す（Reactの「レンダー中に状態を調整する」パターン。
+  // allMembers読み込み前の空配列で誤って"all"に戻さないようlength>0の間だけ判定する）。
+  if(allMembers.length>0){
+    const resolved=resolveViewFilterMemberId(viewFilterMemberId,activeMemberOptions(allMembers));
+    if(resolved!==viewFilterMemberId)setViewFilterMemberId(resolved);
+  }
+
+  // 担当者フィルターが変わったら架電対象のインデックスを0へ戻す。
+  // 件数が変わってcallIndexが範囲外になった場合も0へ補正する（同じくレンダー中に調整）。
+  const [prevViewFilterMemberId,setPrevViewFilterMemberId]=useState(viewFilterMemberId);
+  const filterChanged=viewFilterMemberId!==prevViewFilterMemberId;
+  if(filterChanged)setPrevViewFilterMemberId(viewFilterMemberId);
+  const resolvedCallIndex=resolveCallIndex({filterChanged,callIndex,filteredCompaniesLength:filteredCompanies.length});
+  if(resolvedCallIndex!==callIndex)setCallIndex(resolvedCallIndex);
+
   const callCompany=(company:Company)=>{setCallIndex(Math.max(0,filteredCompanies.findIndex(c=>c.id===company.id)));go("call")};
   const logout=async()=>{if(isSupabaseConfigured)await createClient().auth.signOut();location.href="/login"};
 
@@ -73,15 +93,15 @@ export default function CallFlowApp() {
       <div className="px-4 pb-10 md:px-8">{loading?<Loading/>:<>
         {view==="dashboard"&&<Dashboard companies={filteredCompanies} logs={filteredLogs} go={go}/>}
         {view==="companies"&&<Companies companies={filteredCompanies} callCompany={callCompany} add={()=>setCompanyModal(true)} bulkImport={()=>setImportModal(true)} csvImport={()=>setCsvModal(true)}/>}
-        {view==="call"&&<CallScreen company={filteredCompanies[callIndex]} member={currentUserName} next={()=>setCallIndex(i=>(i+1)%filteredCompanies.length)} onSaved={refresh} notify={notify}/>}
+        {view==="call"&&<CallScreen company={filteredCompanies[callIndex]} member={currentUserName} next={()=>setCallIndex(i=>filteredCompanies.length?(i+1)%filteredCompanies.length:0)} onSaved={refresh} notify={notify}/>}
         {view==="history"&&<HistoryView logs={filteredLogs}/>}
-        {view==="team"&&<Team logs={logs} allMembers={allMembers} pendingInvitations={pendingInvitations} viewFilterMemberId={viewFilterMemberId} currentUserId={currentUserId} isAdmin={isAdmin} notify={notify} refresh={refresh}/>}
+        {view==="team"&&<Team logs={filteredLogs} allMembers={allMembers} pendingInvitations={pendingInvitations} viewFilterMemberId={viewFilterMemberId} currentUserId={currentUserId} isAdmin={isAdmin} notify={notify} refresh={refresh}/>}
       </>}</div>
     </main>
     {companyModal&&<CompanyModal member={currentUserName} close={()=>setCompanyModal(false)} saved={async c=>{setCompanies(x=>[c,...x]);setCompanyModal(false);notify("企業を登録しました")}}/>}
     {importModal&&<LeadImportModal member={currentUserName} existing={companies} close={()=>setImportModal(false)} saved={async added=>{await refresh();setImportModal(false);notify(`${added}件の営業先を取り込みました`)}}/>}
     {csvModal&&<CsvImportModal member={currentUserName} existing={companies} close={()=>setCsvModal(false)} saved={async summary=>{await refresh();setCsvModal(false);notify(`新規${summary.newCount}件・更新${summary.updatedCount}件を登録しました（スキップ${summary.skippedCount}件・エラー${summary.errorCount}件）`)}}/>}
-    {aiModal&&<TranscriptModal company={companies[callIndex]} close={()=>setAiModal(false)} onApply={(a,transcript)=>{sessionStorage.setItem("callflow_analysis",JSON.stringify({...a,transcript}));setAiModal(false);go("call");notify("解析結果を架電記録へ反映しました")}}/>}
+    {aiModal&&<TranscriptModal company={filteredCompanies[callIndex]} close={()=>setAiModal(false)} onApply={(a,transcript)=>{sessionStorage.setItem("callflow_analysis",JSON.stringify({...a,transcript}));setAiModal(false);go("call");notify("解析結果を架電記録へ反映しました")}}/>}
     {toast&&<div className="fixed bottom-6 right-6 z-[70] rounded-xl bg-[#152039] px-5 py-3 text-sm font-semibold text-white shadow-2xl">{toast}</div>}
     {!isSupabaseConfigured&&<div className="fixed bottom-3 left-3 z-20 rounded-full bg-amber-100 px-3 py-1 text-[10px] font-bold text-amber-800 lg:left-[250px]">デモモード</div>}
   </div>;
@@ -121,10 +141,12 @@ function Team({logs,allMembers,pendingInvitations,viewFilterMemberId,currentUser
  // メンバー実績ランキングは「絞り込み」の対象（過去の実績は利用停止メンバーも保持するためallMembersを母集団にする）
  const rankedMembers=useMemo(()=>viewFilterMemberId==="all"?allMembers:allMembers.filter(m=>m.id===viewFilterMemberId),[allMembers,viewFilterMemberId]);
  const data=useMemo(()=>rankedMembers.map(m=>{const own=logs.filter(l=>l.caller_id===m.id);return {id:m.id,name:m.full_name,active:m.active,calls:own.length,appt:own.filter(l=>l.result==="アポ獲得").length}}).sort((a,b)=>b.calls-a.calls),[rankedMembers,logs]);
- const connection=logs.length?Math.round(logs.filter(l=>l.result!=="担当者不在").length/logs.length*100):0;
+ // logsは呼び出し元（CallFlowApp）で担当者フィルター済み。"全員"ならチーム全体、
+ // 特定担当者ならその人だけの数値になる
+ const kpis=useMemo(()=>computeTeamKpis(logs),[logs]);
  const [inviteModal,setInviteModal]=useState(false);
  return <div>
-  <div className="grid grid-cols-2 gap-3 md:grid-cols-3"><Kpi l="チーム架電数" v={logs.length}/><Kpi l="チームアポ数" v={logs.filter(l=>l.result==="アポ獲得").length}/><Kpi l="平均接続率" v={`${connection}%`}/></div>
+  <div className="grid grid-cols-2 gap-3 md:grid-cols-3"><Kpi l="チーム架電数" v={kpis.totalCalls}/><Kpi l="チームアポ数" v={kpis.totalAppointments}/><Kpi l="平均接続率" v={`${kpis.connectionRate}%`}/></div>
   <div className="card mt-4"><CardHead title="メンバー実績" sub="直近500件"/><div className="p-5">{data.map((r,i)=><div key={r.id} className="grid grid-cols-[30px_1fr_65px_65px] items-center gap-3 border-b border-slate-100 py-3 last:border-0"><b className={i===0?"text-amber-500":"text-slate-400"}>{i+1}</b><div><b className="text-xs">{r.name}{!r.active&&<span className="ml-1.5 rounded bg-slate-100 px-1.5 py-0.5 text-[9px] font-bold text-slate-500">利用停止</span>}</b><div className="mt-1.5 h-1.5 overflow-hidden rounded bg-slate-100"><i className="block h-full rounded bg-blue-600" style={{width:`${Math.max(8,r.calls/Math.max(1,data[0]?.calls||1)*100)}%`}}/></div></div><p className="text-right text-sm font-bold">{r.calls}<small className="block text-[9px] font-normal text-slate-500">架電</small></p><p className="text-right text-sm font-bold">{r.appt}<small className="block text-[9px] font-normal text-slate-500">アポ</small></p></div>)}{!data.length&&<p className="p-8 text-center text-xs text-slate-500">該当するメンバーがいません</p>}</div></div>
   {isAdmin&&<div className="card mt-4">
    <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><h2 className="text-sm font-extrabold">メンバー管理</h2><button className="btn btn-primary !py-1.5 text-xs" onClick={()=>setInviteModal(true)}><Plus size={14}/>メンバーを追加</button></div>

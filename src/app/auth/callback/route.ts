@@ -1,12 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-
-// accept_pending_invitation()が投げる例外メッセージを、/loginへ渡すエラーコードへ変換する
-function invitationErrorCode(message: string | undefined): string {
-  const known = ["email_not_confirmed", "account_inactive", "no_pending_invitation", "ambiguous_invitation_state"];
-  const code = (message || "").trim();
-  return known.includes(code) ? code : "no_invitation";
-}
+import { invitationErrorCode } from "@/lib/members";
 
 export async function GET(request: Request) {
   const url = new URL(request.url);

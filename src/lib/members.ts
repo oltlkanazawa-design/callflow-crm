@@ -14,10 +14,47 @@ export function filterLogsByMember(logs: CallLog[], viewFilterMemberId: ViewFilt
   return logs.filter(l => l.caller_id === viewFilterMemberId);
 }
 
+// statusはまだ'pending'のままでもexpires_atが過去のものは、
+// 「初回ログイン待ち」として画面に表示しない（クライアント側の防御的フィルタ。
+// data.tsのSupabaseクエリ側でも.gt("expires_at", now)を適用済み）。
+export function filterActivePendingInvitations(invitations: MemberInvitation[], now: Date = new Date()): MemberInvitation[] {
+  return invitations.filter(i => i.status === "pending" && new Date(i.expires_at).getTime() > now.getTime());
+}
+
 // 担当者選択欄（新規割当・表示絞り込み）にはactive=trueのメンバーのみを出す。
 // 利用停止メンバーは新しい担当者として選択できないようにするため。
 export function activeMemberOptions(members: Member[]): Member[] {
   return members.filter(m => m.active);
+}
+
+// 保存済みの担当者フィルターが、現在の有効なメンバー一覧に存在しない
+// （削除・利用停止済みを含む）場合は"all"へ戻す。担当者セレクトが
+// 空欄になる状態を防ぐため。allMembersがまだ読み込まれていない（空配列の）
+// 間は判定しない（呼び出し側でactiveMembers.length>0のときだけ呼ぶ想定）。
+export function resolveViewFilterMemberId(candidateId: ViewFilterMemberId, activeMembers: Member[]): ViewFilterMemberId {
+  if (candidateId === "all") return "all";
+  return activeMembers.some(m => m.id === candidateId) ? candidateId : "all";
+}
+
+// 担当者フィルターが変わったら0へ戻す。件数が変わって現在のインデックスが
+// 範囲外になった場合も0へ補正する。件数が0の場合は補正しない
+// （CallScreen側で「架電対象の企業がありません」を表示するため）。
+export function resolveCallIndex(params: { filterChanged: boolean; callIndex: number; filteredCompaniesLength: number }): number {
+  const { filterChanged, callIndex, filteredCompaniesLength } = params;
+  if (filterChanged) return 0;
+  if (filteredCompaniesLength > 0 && callIndex >= filteredCompaniesLength) return 0;
+  return callIndex;
+}
+
+export interface TeamKpis { totalCalls: number; totalAppointments: number; connectionRate: number }
+
+// メンバー実績画面のKPI（架電数・アポ数・平均接続率）。担当者で絞り込んだ
+// ログを渡せば、その担当者だけの数値になる（"全員"ならチーム全体のまま）。
+export function computeTeamKpis(logs: CallLog[]): TeamKpis {
+  const totalCalls = logs.length;
+  const totalAppointments = logs.filter(l => l.result === "アポ獲得").length;
+  const connectionRate = logs.length ? Math.round(logs.filter(l => l.result !== "担当者不在").length / logs.length * 100) : 0;
+  return { totalCalls, totalAppointments, connectionRate };
 }
 
 export type MemberDisplayStatus = "invited" | "active" | "inactive";
@@ -96,6 +133,16 @@ const MEMBER_ERROR_MESSAGES: Record<string, string> = {
 export function memberErrorMessage(rawMessage: string | undefined | null): string {
   const code = (rawMessage || "").trim();
   return MEMBER_ERROR_MESSAGES[code] || "操作に失敗しました。時間をおいて再度お試しください";
+}
+
+// accept_pending_invitation()が投げる例外メッセージを、/loginへ渡すエラーコードへ変換する。
+// RPC未作成・SQL不整合・DB障害などの未知のエラーを「招待されていない」と
+// 誤表示しないよう、既知のビジネスエラーコード以外はsystem_errorにする。
+export function invitationErrorCode(message: string | undefined | null): string {
+  const code = (message || "").trim();
+  if (code === "no_pending_invitation") return "no_invitation";
+  if (code === "account_inactive" || code === "email_not_confirmed" || code === "ambiguous_invitation_state") return code;
+  return "system_error";
 }
 
 const sessionKey = "callflow_view_filter_member_id";

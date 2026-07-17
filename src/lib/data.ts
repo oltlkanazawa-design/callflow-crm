@@ -1,6 +1,6 @@
 import { createClient, isDemoModeAllowed, isSupabaseConfigured } from "./supabase/client";
 import { demoCompanies, demoLogs, demoMembers } from "./demo-data";
-import { memberErrorMessage } from "./members";
+import { memberErrorMessage, filterActivePendingInvitations } from "./members";
 import type { CallLog, Company, Member, MemberInvitation, MemberRole } from "./types";
 
 // Supabaseの技術的なエラーメッセージのうち、既知のパターンは営業担当にも分かる文言へ変換する
@@ -56,16 +56,21 @@ export async function loadCRMData(): Promise<CRMData> {
   const currentUser = me?.full_name || "ログインユーザー";
   const isAdmin = me?.role === "admin" && me.active === true;
 
-  // 招待一覧はadminのみRLSで閲覧できる。admin以外は0件が返るため、
-  // エラーにはせずそのまま空配列として扱う
+  // 招待一覧はadminのみRLSで閲覧できる。admin以外は元々0件が返るため
+  // エラー扱いにしない。ただしテーブル未作成・RLS不整合等の本物のエラーは
+  // 空配列で隠さず、はっきり例外として投げる。
+  // 期限切れのpending招待（statusはまだ'pending'のまま）を「初回ログイン待ち」
+  // として誤表示しないよう、expires_atが現在時刻より後のものだけを取得する。
   let pendingInvitations: MemberInvitation[] = [];
   if (isAdmin) {
-    const { data: invitations } = await supabase
+    const { data: invitations, error: ie } = await supabase
       .from("member_invitations")
       .select("id,email,full_name,role,status,expires_at,created_at")
       .eq("status", "pending")
+      .gt("expires_at", new Date().toISOString())
       .order("created_at", { ascending: false });
-    pendingInvitations = (invitations || []) as MemberInvitation[];
+    if (ie) throw ie;
+    pendingInvitations = filterActivePendingInvitations((invitations || []) as MemberInvitation[]);
   }
 
   return {

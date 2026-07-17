@@ -11,6 +11,7 @@ const LOGIN_ERROR_MESSAGES: Record<string, string> = {
   email_not_confirmed: "Googleアカウントのメールアドレスが確認されていません。",
   ambiguous_invitation_state: "招待の状態を確認できませんでした。管理者にお問い合わせください。",
   oauth_callback: "Googleログインを完了できませんでした。時間をおいて再度お試しください。",
+  system_error: "システムエラーによりログインを完了できませんでした。管理者にお問い合わせください。",
 };
 
 function initialLoginError():string{
