@@ -58,7 +58,8 @@ insert into public.profiles (id, organization_id, full_name, role, active) value
 insert into public.companies (id, organization_id, name, phone, location, owner_id) values
   ('c0000000-0000-0000-0000-000000000001','a0000000-0000-0000-0000-00000000000a','競合テスト企業1','03-1111-1111','東京都','a1111111-1111-1111-1111-111111111111'),
   ('c0000000-0000-0000-0000-000000000002','a0000000-0000-0000-0000-00000000000a','競合テスト企業2','03-2222-2222','東京都','a1111111-1111-1111-1111-111111111111'),
-  ('c0000000-0000-0000-0000-000000000003','a0000000-0000-0000-0000-00000000000a','競合テスト企業3','03-3333-3333','東京都','a1111111-1111-1111-1111-111111111111');
+  ('c0000000-0000-0000-0000-000000000003','a0000000-0000-0000-0000-00000000000a','競合テスト企業3','03-3333-3333','東京都','a1111111-1111-1111-1111-111111111111'),
+  ('c0000000-0000-0000-0000-000000000004','a0000000-0000-0000-0000-00000000000a','競合テスト企業4','03-4444-4444','東京都','a1111111-1111-1111-1111-111111111111');
 SQL
 
 echo "=== 競合1: block_company_calls と create_company_checked の同時実行 ==="
@@ -137,18 +138,20 @@ else
 fi
 
 echo "=== 競合5: record_call と block_company_calls の同時実行 ==="
+# 企業4を使用する（企業2は競合2で既にblock済みのまま残っており、record_callの
+# 「開始時点では未禁止」という前提が崩れてしまうため、この競合専用の未使用企業を使う）
 run_as 'a2222222-2222-2222-2222-222222222222' \
-  "select public.record_call('c0000000-0000-0000-0000-000000000002'::uuid, '再架電', '競合5架電テスト');" \
+  "select public.record_call('c0000000-0000-0000-0000-000000000004'::uuid, '再架電', '競合5架電テスト');" \
   > /tmp/comp5_a.log 2>/tmp/comp5_a.err &
 PID_A=$!
 sleep 0.3
 run_as 'a1111111-1111-1111-1111-111111111111' \
-  "select public.block_company_calls(p_company_id:='c0000000-0000-0000-0000-000000000002', p_match_scope:='phone', p_reason:='競合5禁止テスト');" \
+  "select public.block_company_calls(p_company_id:='c0000000-0000-0000-0000-000000000004', p_match_scope:='phone', p_reason:='競合5禁止テスト');" \
   > /tmp/comp5_b.log 2>/tmp/comp5_b.err &
 PID_B=$!
 wait "$PID_A" "$PID_B"
-LOG_CNT=$(psql "$DB_URL" -v ON_ERROR_STOP=1 -t -A -c "select count(*) from public.call_logs where company_id='c0000000-0000-0000-0000-000000000002' and note='競合5架電テスト';")
-PROHIBITED=$(psql "$DB_URL" -v ON_ERROR_STOP=1 -t -A -c "select call_prohibited from public.companies_with_call_status where id='c0000000-0000-0000-0000-000000000002';")
+LOG_CNT=$(psql "$DB_URL" -v ON_ERROR_STOP=1 -t -A -c "select count(*) from public.call_logs where company_id='c0000000-0000-0000-0000-000000000004' and note='競合5架電テスト';")
+PROHIBITED=$(psql "$DB_URL" -v ON_ERROR_STOP=1 -t -A -c "select call_prohibited from public.companies_with_call_status where id='c0000000-0000-0000-0000-000000000004';")
 if [ "$LOG_CNT" = "1" ] && [ "$PROHIBITED" = "t" ]; then
   check "競合5" 0 "record_callとblock_company_callsは直列化され、両方とも矛盾なく完了した（デッドロック無し）"
 else
@@ -156,18 +159,18 @@ else
 fi
 
 echo "=== 競合6: unblock_company_calls と record_call の同時実行 ==="
-BLOCK_ID_2=$(psql "$DB_URL" -v ON_ERROR_STOP=1 -t -A -c "select id from public.call_blocklist where company_id='c0000000-0000-0000-0000-000000000002' and active;")
+BLOCK_ID_2=$(psql "$DB_URL" -v ON_ERROR_STOP=1 -t -A -c "select id from public.call_blocklist where company_id='c0000000-0000-0000-0000-000000000004' and active;")
 run_as 'a1111111-1111-1111-1111-111111111111' \
   "select public.unblock_company_calls('$BLOCK_ID_2'::uuid, '競合6解除テスト');" \
   > /tmp/comp6_a.log 2>/tmp/comp6_a.err &
 PID_A=$!
 sleep 0.3
 run_as 'a2222222-2222-2222-2222-222222222222' \
-  "select public.record_call('c0000000-0000-0000-0000-000000000002'::uuid, '再架電', '競合6架電テスト');" \
+  "select public.record_call('c0000000-0000-0000-0000-000000000004'::uuid, '再架電', '競合6架電テスト');" \
   > /tmp/comp6_b.log 2>/tmp/comp6_b.err &
 PID_B=$!
 wait "$PID_A" "$PID_B"
-LOG_CNT6=$(psql "$DB_URL" -v ON_ERROR_STOP=1 -t -A -c "select count(*) from public.call_logs where company_id='c0000000-0000-0000-0000-000000000002' and note='競合6架電テスト';")
+LOG_CNT6=$(psql "$DB_URL" -v ON_ERROR_STOP=1 -t -A -c "select count(*) from public.call_logs where company_id='c0000000-0000-0000-0000-000000000004' and note='競合6架電テスト';")
 if [ "$LOG_CNT6" = "1" ]; then
   check "競合6" 0 "unblockが先にコミットされていれば、後発のrecord_callは正常に成功する"
 else
