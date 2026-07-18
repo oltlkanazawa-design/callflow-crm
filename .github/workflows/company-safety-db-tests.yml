@@ -195,19 +195,11 @@ jobs:
           set -euo pipefail
           psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/fixtures/ci-privileges-setup.sql
           psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/schema.sql
-          # company-safety-concurrency.sqlはdblinkで2本目のDB接続（既定のUNIX
-          # ソケット経由）を張る。DB_URLにパスワードが含まれているとは限らない
-          # （supabase CLIのstatus出力や認証方式のバージョン差異に依存するため）ので、
-          # 推測に頼らず、このジョブ専用のCI一時DBに対してのみ有効な使い捨て
-          # パスワードをその場で設定してから、同じ値をdblinkにも渡す。
-          DB_USER=$(python3 -c "import sys,urllib.parse as p; u=p.urlparse(sys.argv[1]); print(u.username)" "$DB_URL")
-          DB_NAME=$(python3 -c "import sys,urllib.parse as p; u=p.urlparse(sys.argv[1]); print((u.path or '/postgres').lstrip('/') or 'postgres')" "$DB_URL")
-          DB_PASS="ci-sandbox-$(date +%s)-$RANDOM"
-          echo "::add-mask::$DB_PASS"
-          psql "$DB_URL" -v ON_ERROR_STOP=1 -c "alter role \"$DB_USER\" password '$DB_PASS';"
-          psql "$DB_URL" -v ON_ERROR_STOP=1 \
-            -v dblink_user="$DB_USER" -v dblink_password="$DB_PASS" -v dblink_dbname="$DB_NAME" \
-            -f supabase/tests/company-safety-concurrency.sql
+          # 同時実行テストは、2本のpsqlプロセスをシェルレベルで並列起動して行う
+          # （dblink拡張は、supabase CLIローカルスタックのロール権限・認証方式の
+          # 差異により安定して使えなかったため採用しなかった）
+          chmod +x supabase/tests/company-safety-concurrency.sh
+          supabase/tests/company-safety-concurrency.sh "$DB_URL"
 
       - name: Stop Supabase sandbox
         if: always()
