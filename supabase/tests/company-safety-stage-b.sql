@@ -108,14 +108,14 @@ reset role;
 \echo '=== T5: 段階B適用後もcreate_company_checked()は成功する ==='
 set role authenticated;
 set request.jwt.claim.sub = 'a1111111-1111-1111-1111-111111111111';
-select public.create_company_checked(
-  p_name:='段階B後のRPC経由登録', p_phone:='080-1234-5678', p_website_url:=null, p_location:='テスト所在地'
-) as t5_result \gset
-reset role;
 do $$
+declare v_result jsonb;
 begin
-  if (:'t5_result')::jsonb->>'status' <> 'inserted' then
-    raise exception 'FAIL[T5]: 段階B適用後にcreate_company_checkedが失敗しました（結果: %）', :'t5_result';
+  select public.create_company_checked(
+    p_name:='段階B後のRPC経由登録', p_phone:='080-1234-5678', p_website_url:=null, p_location:='テスト所在地'
+  ) into v_result;
+  if v_result->>'status' <> 'inserted' then
+    raise exception 'FAIL[T5]: 段階B適用後にcreate_company_checkedが失敗しました（結果: %）', v_result;
   end if;
   raise notice 'PASS[T5]: 段階B適用後も確認済みRPC経由の登録は成功する';
 end $$;

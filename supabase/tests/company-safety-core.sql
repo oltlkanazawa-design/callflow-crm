@@ -236,22 +236,22 @@ end $$;
 \echo '=== T14: 行エラーの結果にPostgresの生メッセージ（制約名等）が含まれない ==='
 set role authenticated;
 set request.jwt.claim.sub = 'a1111111-1111-1111-1111-111111111111';
-select public.create_companies_checked(
-  p_rows := $j$[{"name":"重複キー衝突テスト1","phone":"070-5555-5555","location":"テスト"},{"name":"重複キー衝突テスト1","phone":"070-5555-5555","location":"テスト"}]$j$::jsonb
-) as t14_result \gset
-reset role;
 do $$
-declare v_row jsonb;
+declare v_result jsonb; v_row jsonb;
 begin
-  v_row := (:'t14_result')::jsonb -> 'results' -> 1;
+  select public.create_companies_checked(
+    p_rows := $j$[{"name":"重複キー衝突テスト1","phone":"070-5555-5555","location":"テスト"},{"name":"重複キー衝突テスト1","phone":"070-5555-5555","location":"テスト"}]$j$::jsonb
+  ) into v_result;
+  v_row := v_result -> 'results' -> 1;
   if v_row->>'status' <> 'skipped' or v_row->>'reason' <> 'duplicate_within_csv' then
     raise exception 'FAIL[T14]: 2行目がduplicate_within_csvとして処理されませんでした（結果: %）', v_row;
   end if;
-  if (:'t14_result') like '%constraint%' or (:'t14_result') like '%duplicate key value violates%' then
+  if v_result::text like '%constraint%' or v_result::text like '%duplicate key value violates%' then
     raise exception 'FAIL[T14]: 行エラーの結果にPostgresの生メッセージが含まれています';
   end if;
   raise notice 'PASS[T14]: 行エラーの結果に生のPostgresメッセージは含まれていない';
 end $$;
+reset role;
 
 \echo '=== T15: 一般メンバーはblock_company_calls / unblock_company_callsを実行できない ==='
 set role authenticated;
@@ -329,28 +329,28 @@ reset role;
 \echo '=== T18: create_companies_checkedはCSV一括登録で新規・重複スキップ・エラーが混在しても部分成功する ==='
 set role authenticated;
 set request.jwt.claim.sub = 'a1111111-1111-1111-1111-111111111111';
-select public.create_companies_checked(
-  p_rows := $j$[
-    {"name":"T18新規企業","phone":"050-1000-0001","location":"北海道札幌市"},
-    {"name":"T18新規企業複製","phone":"050-1000-0001","location":"北海道札幌市"},
-    {"name":"","phone":"050-9999-0000","location":"沖縄県那覇市"},
-    {"name":"T18企業名所在地一致企業","phone":"","location":"愛知県名古屋市"}
-  ]$j$::jsonb
-) as t18_result \gset
-reset role;
 do $$
-declare v_r jsonb;
+declare v_result jsonb; v_r jsonb;
 begin
-  v_r := (:'t18_result')::jsonb -> 'results' -> 0;
+  select public.create_companies_checked(
+    p_rows := $j$[
+      {"name":"T18新規企業","phone":"050-1000-0001","location":"北海道札幌市"},
+      {"name":"T18新規企業複製","phone":"050-1000-0001","location":"北海道札幌市"},
+      {"name":"","phone":"050-9999-0000","location":"沖縄県那覇市"},
+      {"name":"T18企業名所在地一致企業","phone":"","location":"愛知県名古屋市"}
+    ]$j$::jsonb
+  ) into v_result;
+  v_r := v_result -> 'results' -> 0;
   if v_r->>'status' <> 'inserted' then raise exception 'FAIL[T18]: 1行目(新規)がinsertedになりませんでした（%）', v_r; end if;
-  v_r := (:'t18_result')::jsonb -> 'results' -> 1;
+  v_r := v_result -> 'results' -> 1;
   if v_r->>'status' <> 'skipped' or v_r->>'reason' <> 'duplicate_within_csv' then raise exception 'FAIL[T18]: 2行目(CSV内重複)が正しく処理されませんでした（%）', v_r; end if;
-  v_r := (:'t18_result')::jsonb -> 'results' -> 2;
+  v_r := v_result -> 'results' -> 2;
   if v_r->>'status' <> 'error' or v_r->>'error_code' <> 'name_required' then raise exception 'FAIL[T18]: 3行目(企業名なし)がエラーになりませんでした（%）', v_r; end if;
-  v_r := (:'t18_result')::jsonb -> 'results' -> 3;
+  v_r := v_result -> 'results' -> 3;
   if v_r->>'status' <> 'skipped' then raise exception 'FAIL[T18]: 4行目(既存企業名+所在地一致)がスキップされませんでした（%）', v_r; end if;
   raise notice 'PASS[T18]: CSV一括登録は新規・重複スキップ・エラー混在でも部分成功する';
 end $$;
+reset role;
 do $$
 declare v_cnt int;
 begin
