@@ -1,4 +1,4 @@
-import type { Company, Heat } from "./types";
+import type { Company } from "./types";
 
 export type CanonicalField = "name" | "phone" | "website_url" | "location" | "industry" | "contact_name" | "email" | "memo" | "list_source";
 export type ColumnMapping = Record<number, CanonicalField | "">;
@@ -149,10 +149,6 @@ export function normalizeName(raw: string): string {
   return (raw || "").trim().replace(/\s+/g, "").toLowerCase();
 }
 
-function normalizeUrlValue(url: string): string {
-  return /^https?:\/\//i.test(url) ? url : `https://${url}`;
-}
-
 interface RegistryEntry { existing?: Company }
 interface Registry {
   phone: Map<string, RegistryEntry>;
@@ -253,44 +249,6 @@ export function summarizeRows(headers: string[], mapping: ColumnMapping, rows: C
   const validCount = rows.length - missingRequiredCount;
   const duplicateCount = rows.filter(r => !r.errors.length && r.duplicate).length;
   return { total: rows.length, validCount, missingRequiredCount, duplicateCount, headers, mapping, previewRows: rows.slice(0, previewCount) };
-}
-
-export function rowToCompanyDraft(row: CsvRowResult, owner: string, defaultListSource: string): Company {
-  return {
-    id: crypto.randomUUID(),
-    name: row.name,
-    industry: row.industry,
-    location: row.location,
-    phone: toHalfWidthDigits(row.phone),
-    website_url: row.website_url ? normalizeUrlValue(row.website_url) : undefined,
-    email: row.email || undefined,
-    list_source: row.list_source || defaultListSource || "CSV一括登録",
-    contact_name: row.contact_name,
-    contact_department: "",
-    heat: "低" as Heat,
-    owner_name: owner,
-    memo: row.memo || "CSV一括登録で取り込み",
-  };
-}
-
-/** 重複更新用のpatchを組み立てる。CSV側が空欄の項目は既存企業の値を保持し、上書きしない */
-export function buildCompanyUpdatePatch(
-  row: CsvRowResult,
-  existing: Company,
-  defaultListSource: string,
-): Partial<Omit<Company, "id" | "owner_name">> {
-  const patch: Partial<Omit<Company, "id" | "owner_name">> = {};
-  if (row.name) patch.name = row.name;
-  if (row.phone) patch.phone = toHalfWidthDigits(row.phone);
-  if (row.website_url) patch.website_url = normalizeUrlValue(row.website_url);
-  if (row.location) patch.location = row.location;
-  if (row.industry) patch.industry = row.industry;
-  if (row.contact_name) patch.contact_name = row.contact_name;
-  if (row.email) patch.email = row.email;
-  if (row.memo) patch.memo = row.memo;
-  const listSource = row.list_source || defaultListSource;
-  if (listSource) patch.list_source = listSource;
-  return patch;
 }
 
 function escapeCsvField(v: string): string {
