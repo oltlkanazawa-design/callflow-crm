@@ -145,8 +145,24 @@ export function urlDomain(raw: string): string {
   return v;
 }
 
+// 法人格の表記揺れ（株式会社／(株)／（株）／㈱ など）を同一形式へ正規化してから
+// 空白除去・小文字化する。法人格そのものを削除すると別の企業と誤って一致する
+// 範囲が広がるため、明確な表記差だけを吸収する（SQL側のnormalize_company_name
+// と同じ変換内容・同じ優先順位で実装すること）。
+function normalizeCorporateForm(raw: string): string {
+  return raw
+    .replace(/\(株\)/g, "株式会社")
+    .replace(/（株）/g, "株式会社")
+    .replace(/㈱/g, "株式会社")
+    .replace(/\(有\)/g, "有限会社")
+    .replace(/（有）/g, "有限会社")
+    .replace(/㈲/g, "有限会社")
+    .replace(/\(同\)/g, "合同会社")
+    .replace(/（同）/g, "合同会社");
+}
+
 export function normalizeName(raw: string): string {
-  return (raw || "").trim().replace(/\s+/g, "").toLowerCase();
+  return normalizeCorporateForm((raw || "").trim()).replace(/\s+/g, "").toLowerCase();
 }
 
 interface RegistryEntry { existing?: Company }

@@ -140,6 +140,30 @@ test("normalizeName: 前後・内部の空白を除去し小文字化する", ()
   assert.equal(normalizeName(" 株式会社 サンプル 商事 "), "株式会社サンプル商事");
 });
 
+test("normalizeName: 株式会社の表記揺れ（(株)／（株）／㈱）を同一形式へ正規化する", () => {
+  const base = normalizeName("株式会社サンプル商事");
+  assert.equal(normalizeName("(株)サンプル商事"), base);
+  assert.equal(normalizeName("（株）サンプル商事"), base);
+  assert.equal(normalizeName("㈱サンプル商事"), base);
+});
+
+test("normalizeName: 有限会社の表記揺れ（(有)／（有）／㈲）を同一形式へ正規化する", () => {
+  const base = normalizeName("有限会社サンプル商事");
+  assert.equal(normalizeName("(有)サンプル商事"), base);
+  assert.equal(normalizeName("（有）サンプル商事"), base);
+  assert.equal(normalizeName("㈲サンプル商事"), base);
+});
+
+test("normalizeName: 合同会社の表記揺れ（(同)／（同））を同一形式へ正規化する", () => {
+  const base = normalizeName("合同会社サンプル商事");
+  assert.equal(normalizeName("(同)サンプル商事"), base);
+  assert.equal(normalizeName("（同）サンプル商事"), base);
+});
+
+test("normalizeName: 法人格を含まない企業名同士は誤って一致しない", () => {
+  assert.notEqual(normalizeName("株式会社サンプル商事"), normalizeName("サンプル商事"));
+});
+
 test("buildRows: 企業名が無い行のみエラー、電話番号・URL・所在地が空でも登録可能", () => {
   const csv = "企業名,電話番号,URL,所在地\n企業名のみ,,,\n,076-000-0001,https://x.example.com,石川県\n";
   const table = parseCsvText(csv, ",");

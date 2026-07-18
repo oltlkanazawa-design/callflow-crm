@@ -3,7 +3,7 @@ import { demoCompanies, demoLogs, demoMembers } from "./demo-data";
 import { memberErrorMessage, filterActivePendingInvitations } from "./members";
 import { normalizePhone, urlDomain, normalizeName } from "./csv-import";
 import { companySafetyErrorMessage } from "./company-safety";
-import type { OnDuplicate, CheckCompanySafetyResult, CheckedWriteResult, CreateCompaniesCheckedResult, BulkRowResult, BlocklistEntry } from "./company-safety";
+import type { OnDuplicate, MatchScope, CheckCompanySafetyResult, CheckedWriteResult, CreateCompaniesCheckedResult, BulkRowResult, BlocklistEntry } from "./company-safety";
 import type { CallLog, Company, Member, MemberInvitation, MemberRole } from "./types";
 
 const COMPANY_KEY = "callflow_companies_v1";
@@ -92,7 +92,7 @@ export async function saveCallLog(log: CallLog, company: Company): Promise<void>
   }
   const supabase = createClient();
   const { error } = await supabase.rpc("record_call",{p_company_id:company.id,p_result:log.result,p_note:log.note,p_transcript:log.transcript||null,p_ai_summary:log.ai_summary||null,p_next_action_at:log.next_action_at||null,p_heat:company.heat});
-  if (error) throw error;
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
 }
 
 export async function inviteMember(email: string, fullName: string, role: MemberRole): Promise<Member | MemberInvitation> {
@@ -193,8 +193,9 @@ export async function updateMemberName(memberId: string, fullName: string): Prom
 
 interface DemoBlockEntry {
   id: string; company_id: string | null;
-  normalized_phone: string; normalized_domain: string; normalized_name: string; normalized_location: string;
-  match_scope: string; reason: string; active: boolean; created_at: string;
+  normalized_phone: string | null; normalized_domain: string | null;
+  normalized_name: string | null; normalized_location: string | null;
+  match_scope: MatchScope; reason: string; active: boolean; created_at: string;
 }
 
 function readBlocklist(): DemoBlockEntry[] { return readLocal<DemoBlockEntry[]>(BLOCKLIST_KEY, []); }
@@ -209,15 +210,26 @@ function normalizeCompanyKeys(input: { name?: string; phone?: string; website_ur
   };
 }
 
+// match_scopeを厳密に適用する。SQL側のmatch_active_blocklist()と同じ優先順位・
+// 同じ判定（保存列の非NULLだけに頼らず、match_scopeそのものも必ず確認する）
 function matchDemoBlocklist(list: DemoBlockEntry[], keys: { phone: string; domain: string; name: string; location: string }): DemoBlockEntry | null {
   const active = list.filter(b => b.active);
-  if (keys.phone) { const hit = active.find(b => b.normalized_phone === keys.phone); if (hit) return hit; }
-  if (keys.domain) { const hit = active.find(b => b.normalized_domain === keys.domain); if (hit) return hit; }
-  if (keys.name && keys.location) {
-    const hit = active.find(b => b.match_scope !== "name_only" && b.normalized_name === keys.name && b.normalized_location === keys.location);
+  if (keys.phone) {
+    const hit = active.find(b => (b.match_scope === "phone" || b.match_scope === "strict") && b.normalized_phone === keys.phone);
     if (hit) return hit;
   }
-  if (keys.name) { const hit = active.find(b => b.match_scope === "name_only" && b.normalized_name === keys.name); if (hit) return hit; }
+  if (keys.domain) {
+    const hit = active.find(b => (b.match_scope === "domain" || b.match_scope === "strict") && b.normalized_domain === keys.domain);
+    if (hit) return hit;
+  }
+  if (keys.name && keys.location) {
+    const hit = active.find(b => (b.match_scope === "name_location" || b.match_scope === "strict") && b.normalized_name === keys.name && b.normalized_location === keys.location);
+    if (hit) return hit;
+  }
+  if (keys.name) {
+    const hit = active.find(b => b.match_scope === "name_only" && b.normalized_name === keys.name);
+    if (hit) return hit;
+  }
   return null;
 }
 
@@ -242,6 +254,8 @@ function findDemoDuplicate(companies: Company[], keys: { phone: string; domain: 
   return null;
 }
 
+const VALID_ON_DUPLICATE: OnDuplicate[] = ["skip", "update", "insert"];
+
 export async function checkCompanySafety(name: string, phone: string, websiteUrl: string, location: string): Promise<CheckCompanySafetyResult> {
   const keys = normalizeCompanyKeys({ name, phone, website_url: websiteUrl, location });
   if (!isSupabaseConfigured) {
@@ -257,7 +271,7 @@ export async function checkCompanySafety(name: string, phone: string, websiteUrl
   }
   const supabase = createClient();
   const { data, error } = await supabase.rpc("check_company_safety", { p_name: name, p_phone: phone, p_website_url: websiteUrl || null, p_location: location });
-  if (error) throw new Error(companySafetyErrorMessage(error.message));
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
   return data as CheckCompanySafetyResult;
 }
 
@@ -266,26 +280,25 @@ export interface CompanyDraftInput {
   industry?: string; contact_name?: string; email?: string; memo?: string; list_source?: string;
 }
 
-export async function createCompanyChecked(input: CompanyDraftInput, owner: string, onDuplicate: OnDuplicate = "skip", acknowledgeBlocklist = false): Promise<CheckedWriteResult> {
+// 禁止先に一致した企業は、いかなる引数によっても登録を迂回できない
+// （p_acknowledge_blocklistのような迂回引数は存在しない）
+export async function createCompanyChecked(input: CompanyDraftInput, owner: string, onDuplicate: OnDuplicate = "skip"): Promise<CheckedWriteResult> {
+  if (!VALID_ON_DUPLICATE.includes(onDuplicate)) throw new Error(companySafetyErrorMessage("invalid_on_duplicate"));
   const keys = normalizeCompanyKeys(input);
   if (!isSupabaseConfigured) {
     if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
-    if (!keys.name) return { status: "blocked", blocklist_id: "", matched_scope: "", reason: "name_required" } as CheckedWriteResult; // 呼び出し側でerrorとして扱う
+    if (!keys.name) throw new Error(companySafetyErrorMessage("name_required"));
     const block = matchDemoBlocklist(readBlocklist(), keys);
-    if (block && !acknowledgeBlocklist) return { status: "blocked", blocklist_id: block.id, matched_scope: block.match_scope, reason: block.reason };
+    if (block) return { status: "blocked", blocklist_id: block.id, matched_scope: block.match_scope, reason: block.reason };
     const companies = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
     const dup = findDemoDuplicate(companies, keys);
     if (dup && onDuplicate === "skip") return { status: "skipped", existing_company_id: dup.id };
+    if (dup && onDuplicate === "update") return { status: "needs_explicit_update", existing_company_id: dup.id };
     const newCompany: Company = {
       id: crypto.randomUUID(), name: input.name, industry: input.industry || "", location: input.location, phone: input.phone,
       website_url: input.website_url || undefined, email: input.email || undefined, list_source: input.list_source,
       contact_name: input.contact_name || "", contact_department: "", heat: "低", owner_name: owner, memo: input.memo || "",
     };
-    if (dup && onDuplicate === "update") {
-      const updated = companies.map(c => c.id === dup.id ? { ...c, ...newCompany, id: dup.id } : c);
-      localStorage.setItem(COMPANY_KEY, JSON.stringify(updated));
-      return { status: "updated", company: updated.find(c => c.id === dup.id)! as unknown as Record<string, unknown> };
-    }
     localStorage.setItem(COMPANY_KEY, JSON.stringify([newCompany, ...companies]));
     return { status: "inserted", company: newCompany as unknown as Record<string, unknown> };
   }
@@ -294,9 +307,9 @@ export async function createCompanyChecked(input: CompanyDraftInput, owner: stri
     p_name: input.name, p_phone: input.phone, p_website_url: input.website_url || null, p_location: input.location,
     p_industry: input.industry || "", p_contact_name: input.contact_name || "", p_email: input.email || null,
     p_memo: input.memo || "", p_list_source: input.list_source || null,
-    p_on_duplicate: onDuplicate, p_acknowledge_blocklist: acknowledgeBlocklist,
+    p_on_duplicate: onDuplicate,
   });
-  if (error) throw new Error(companySafetyErrorMessage(error.message));
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
   return data as CheckedWriteResult;
 }
 
@@ -306,47 +319,83 @@ export async function createCompaniesChecked(rows: BulkRowInput[], owner: string
   if (!rows.length) return { results: [] };
   if (!isSupabaseConfigured) {
     if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
-    const companies = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
     const blocklist = readBlocklist();
     const seenPhones = new Set<string>(), seenDomains = new Set<string>(), seenNameLocs = new Set<string>();
     const results: BulkRowResult[] = [];
     const toAdd: Company[] = [];
-    let working = companies;
+    let working = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+
+    const markSeen = (k: { phone: string; domain: string; name: string; location: string }) => {
+      if (k.phone) seenPhones.add(k.phone);
+      if (k.domain) seenDomains.add(k.domain);
+      if (k.name && k.location) seenNameLocs.add(`${k.name}|${k.location}`);
+    };
+
     rows.forEach((row, i) => {
       const rowNum = i + 1;
-      const keys = normalizeCompanyKeys(row);
       const onDup = row.on_duplicate || defaultOnDuplicate;
+      if (!VALID_ON_DUPLICATE.includes(onDup)) {
+        results.push({ row: rowNum, status: "error", error_code: "invalid_on_duplicate" });
+        return;
+      }
+      const keys = normalizeCompanyKeys(row);
       if (!keys.name) { results.push({ row: rowNum, status: "error", error_code: "name_required" }); return; }
       const withinCsv = (keys.phone && seenPhones.has(keys.phone)) || (keys.domain && seenDomains.has(keys.domain)) || (keys.name && keys.location && seenNameLocs.has(`${keys.name}|${keys.location}`));
       if (withinCsv) { results.push({ row: rowNum, status: "skipped", reason: "duplicate_within_csv" }); return; }
+
       const block = matchDemoBlocklist(blocklist, keys);
       if (block) {
         results.push({ row: rowNum, status: "blocked", blocklist_id: block.id, matched_scope: block.match_scope });
-        if (keys.phone) seenPhones.add(keys.phone); if (keys.domain) seenDomains.add(keys.domain);
-        if (keys.name && keys.location) seenNameLocs.add(`${keys.name}|${keys.location}`);
+        markSeen(keys);
         return;
       }
+
       const dup = findDemoDuplicate([...working, ...toAdd], keys);
-      if (dup && onDup === "skip") { results.push({ row: rowNum, status: "skipped", existing_company_id: dup.id }); }
-      else if (dup && onDup === "update") {
+      if (dup && onDup === "skip") {
+        results.push({ row: rowNum, status: "skipped", existing_company_id: dup.id });
+        markSeen(keys);
+        return;
+      }
+      if (dup && onDup === "update") {
+        // 実効値（CSVが空欄なら既存値のまま）を合成してから禁止・重複を再判定する。
+        // 空欄入力で既存の禁止一致キーを外して禁止判定を回避できないようにするため。
+        const effective = {
+          name: row.name || dup.name, phone: row.phone || dup.phone,
+          website_url: row.website_url || dup.website_url, location: row.location || dup.location,
+        };
+        const effKeys = normalizeCompanyKeys(effective);
+        const effBlock = matchDemoBlocklist(blocklist, effKeys);
+        if (effBlock) {
+          results.push({ row: rowNum, status: "blocked", blocklist_id: effBlock.id, matched_scope: effBlock.match_scope });
+          markSeen(effKeys);
+          return;
+        }
+        const conflicting = findDemoDuplicate([...working, ...toAdd], effKeys, dup.id);
+        if (conflicting) {
+          results.push({ row: rowNum, status: "skipped", reason: "duplicate_conflict", conflicting_company_id: conflicting.id });
+          markSeen(effKeys);
+          return;
+        }
         working = working.map(c => c.id === dup.id ? {
-          ...c, name: row.name || c.name, phone: row.phone || c.phone, website_url: row.website_url || c.website_url,
-          location: row.location || c.location, industry: row.industry || c.industry, contact_name: row.contact_name || c.contact_name,
+          ...c, name: effective.name, phone: effective.phone, website_url: effective.website_url, location: effective.location,
+          industry: row.industry || c.industry, contact_name: row.contact_name || c.contact_name,
           email: row.email || c.email, memo: row.memo || c.memo, list_source: row.list_source || c.list_source,
         } : c);
         results.push({ row: rowNum, status: "updated", company_id: dup.id });
-      } else {
-        const newCompany: Company = {
-          id: crypto.randomUUID(), name: row.name, industry: row.industry || "", location: row.location, phone: row.phone,
-          website_url: row.website_url || undefined, email: row.email || undefined, list_source: row.list_source,
-          contact_name: row.contact_name || "", contact_department: "", heat: "低", owner_name: owner, memo: row.memo || "",
-        };
-        toAdd.push(newCompany);
-        results.push({ row: rowNum, status: "inserted", company_id: newCompany.id });
+        markSeen(effKeys);
+        return;
       }
-      if (keys.phone) seenPhones.add(keys.phone); if (keys.domain) seenDomains.add(keys.domain);
-      if (keys.name && keys.location) seenNameLocs.add(`${keys.name}|${keys.location}`);
+
+      const newCompany: Company = {
+        id: crypto.randomUUID(), name: row.name, industry: row.industry || "", location: row.location, phone: row.phone,
+        website_url: row.website_url || undefined, email: row.email || undefined, list_source: row.list_source,
+        contact_name: row.contact_name || "", contact_department: "", heat: "低", owner_name: owner, memo: row.memo || "",
+      };
+      toAdd.push(newCompany);
+      results.push({ row: rowNum, status: "inserted", company_id: newCompany.id });
+      markSeen(keys);
     });
+
     localStorage.setItem(COMPANY_KEY, JSON.stringify([...toAdd, ...working]));
     return { results };
   }
@@ -355,11 +404,11 @@ export async function createCompaniesChecked(rows: BulkRowInput[], owner: string
     p_rows: rows.map(r => ({ name: r.name, phone: r.phone, website_url: r.website_url || null, location: r.location, industry: r.industry || "", contact_name: r.contact_name || "", email: r.email || null, memo: r.memo || "", list_source: r.list_source || null, on_duplicate: r.on_duplicate })),
     p_default_on_duplicate: defaultOnDuplicate,
   });
-  if (error) throw new Error(companySafetyErrorMessage(error.message));
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
   return data as CreateCompaniesCheckedResult;
 }
 
-export async function blockCompanyCalls(companyId: string, reason: string): Promise<BlocklistEntry> {
+export async function blockCompanyCalls(companyId: string, reason: string, matchScope: MatchScope = "strict"): Promise<BlocklistEntry> {
   if (!isSupabaseConfigured) {
     if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
     const companies = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
@@ -367,16 +416,47 @@ export async function blockCompanyCalls(companyId: string, reason: string): Prom
     if (!target) throw new Error(companySafetyErrorMessage("company_not_found_in_your_organization"));
     if (!reason.trim()) throw new Error(companySafetyErrorMessage("reason_required"));
     const keys = normalizeCompanyKeys(target);
+
+    if (matchScope === "phone" && !keys.phone) throw new Error(companySafetyErrorMessage("phone_required_for_scope"));
+    if (matchScope === "domain" && !keys.domain) throw new Error(companySafetyErrorMessage("domain_required_for_scope"));
+    if (matchScope === "name_location" && (!keys.name || !keys.location)) throw new Error(companySafetyErrorMessage("name_and_location_required_for_scope"));
+    if (matchScope === "name_only" && !keys.name) throw new Error(companySafetyErrorMessage("name_required_for_scope"));
+    if (matchScope === "strict" && !keys.phone && !keys.domain && !(keys.name && keys.location)) throw new Error(companySafetyErrorMessage("identifier_required"));
+
     const list = readBlocklist();
-    const existing = matchDemoBlocklist(list, keys);
-    if (existing) return { id: existing.id, organization_id: "", company_id: existing.company_id, snapshot_name: target.name, snapshot_location: target.location, snapshot_phone: target.phone, snapshot_domain: target.website_url || null, match_scope: existing.match_scope, reason: existing.reason, note: "", active: true, created_by: "", created_at: existing.created_at, updated_by: null, updated_at: existing.created_at };
-    const entry: DemoBlockEntry = { id: crypto.randomUUID(), company_id: companyId, normalized_phone: keys.phone, normalized_domain: keys.domain, normalized_name: keys.name, normalized_location: keys.location, match_scope: "phone", reason: reason.trim(), active: true, created_at: new Date().toISOString() };
+    const existing = list.find(b => b.active && b.match_scope === matchScope && (
+      (matchScope === "phone" && b.normalized_phone === keys.phone)
+      || (matchScope === "domain" && b.normalized_domain === keys.domain)
+      || (matchScope === "name_location" && b.normalized_name === keys.name && b.normalized_location === keys.location)
+      || (matchScope === "name_only" && b.normalized_name === keys.name)
+      || (matchScope === "strict" && (
+        (Boolean(keys.phone) && b.normalized_phone === keys.phone)
+        || (Boolean(keys.domain) && b.normalized_domain === keys.domain)
+        || (Boolean(keys.name && keys.location) && b.normalized_name === keys.name && b.normalized_location === keys.location)
+      ))
+    ));
+    const toEntry = (e: DemoBlockEntry): BlocklistEntry => ({
+      id: e.id, organization_id: "", company_id: e.company_id, snapshot_name: target.name, snapshot_location: target.location,
+      snapshot_phone: target.phone, snapshot_domain: target.website_url || null, match_scope: e.match_scope, reason: e.reason,
+      note: "", active: e.active, created_by: "", created_at: e.created_at, updated_by: null, updated_at: e.created_at,
+    });
+    if (existing) return toEntry(existing);
+
+    // 選択したscopeに必要な正規化キーだけを保存する（strictのみ、利用可能な強一致キーをすべて保存する）
+    const entry: DemoBlockEntry = {
+      id: crypto.randomUUID(), company_id: companyId,
+      normalized_phone: (matchScope === "phone" || matchScope === "strict") ? (keys.phone || null) : null,
+      normalized_domain: (matchScope === "domain" || matchScope === "strict") ? (keys.domain || null) : null,
+      normalized_name: (matchScope === "name_location" || matchScope === "name_only" || matchScope === "strict") ? (keys.name || null) : null,
+      normalized_location: (matchScope === "name_location" || matchScope === "strict") ? (keys.location || null) : null,
+      match_scope: matchScope, reason: reason.trim(), active: true, created_at: new Date().toISOString(),
+    };
     writeBlocklist([...list, entry]);
-    return { id: entry.id, organization_id: "", company_id: companyId, snapshot_name: target.name, snapshot_location: target.location, snapshot_phone: target.phone, snapshot_domain: target.website_url || null, match_scope: entry.match_scope, reason: entry.reason, note: "", active: true, created_by: "", created_at: entry.created_at, updated_by: null, updated_at: entry.created_at };
+    return toEntry(entry);
   }
   const supabase = createClient();
-  const { data, error } = await supabase.rpc("block_company_calls", { p_company_id: companyId, p_phone: null, p_website_url: null, p_name: null, p_location: null, p_match_scope: "phone", p_reason: reason });
-  if (error) throw new Error(companySafetyErrorMessage(error.message));
+  const { data, error } = await supabase.rpc("block_company_calls", { p_company_id: companyId, p_phone: null, p_website_url: null, p_name: null, p_location: null, p_match_scope: matchScope, p_reason: reason });
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
   return data as BlocklistEntry;
 }
 
@@ -385,13 +465,17 @@ export async function unblockCompanyCalls(blocklistId: string, reason: string): 
     if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
     if (!reason.trim()) throw new Error(companySafetyErrorMessage("reason_required"));
     const list = readBlocklist();
-    const target = list.find(b => b.id === blocklistId && b.active);
+    const target = list.find(b => b.id === blocklistId);
     if (!target) throw new Error(companySafetyErrorMessage("blocklist_entry_not_found"));
+    // 既に解除済みでも技術エラーにせず、同じ行を安全に返す（冪等）
+    if (!target.active) {
+      return { id: target.id, organization_id: "", company_id: target.company_id, snapshot_name: null, snapshot_location: null, snapshot_phone: null, snapshot_domain: null, match_scope: target.match_scope, reason: target.reason, note: "", active: false, created_by: "", created_at: target.created_at, updated_by: null, updated_at: target.created_at };
+    }
     writeBlocklist(list.map(b => b.id === blocklistId ? { ...b, active: false } : b));
     return { id: target.id, organization_id: "", company_id: target.company_id, snapshot_name: null, snapshot_location: null, snapshot_phone: null, snapshot_domain: null, match_scope: target.match_scope, reason: target.reason, note: "", active: false, created_by: "", created_at: target.created_at, updated_by: null, updated_at: new Date().toISOString() };
   }
   const supabase = createClient();
   const { data, error } = await supabase.rpc("unblock_company_calls", { p_blocklist_id: blocklistId, p_reason: reason });
-  if (error) throw new Error(companySafetyErrorMessage(error.message));
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
   return data as BlocklistEntry;
 }

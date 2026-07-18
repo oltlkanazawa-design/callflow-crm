@@ -67,13 +67,23 @@ create or replace function public.current_organization_id() returns uuid languag
   select organization_id from public.profiles where id=auth.uid() and active=true
 $$;
 
--- 5. 新規RPC群を削除
+-- 【注意】段階Aはcurrent_organization_id()の実行権限をpublic/anonから明示的にrevokeし、
+-- authenticatedのみに絞っています。CREATE OR REPLACEは既存の権限設定を変更しないため、
+-- このロールバックを実行してもpublic/anonへの実行権限は復元されず、authenticated限定の
+-- ままになります。これは意図的な措置です：段階A適用前は権限管理をしておらずPostgresの
+-- 既定でpublicに実行権限がありましたが、この関数は組織メンバー以外が呼ぶ必要が無いため、
+-- 制限したままの方が安全です。完全に段階A適用前の権限へ戻したい場合は、別途
+--   grant execute on function public.current_organization_id() to public;
+-- を実行してください（非推奨）。
+
+-- 5. 新規RPC群を削除（段階Aで導入した最終シグネチャに合わせる。
+--    p_acknowledge_blocklist引数は削除済みのため10引数版を指定する）
 drop function if exists public.scan_duplicate_candidates();
 drop function if exists public.unblock_company_calls(uuid,text);
 drop function if exists public.block_company_calls(uuid,text,text,text,text,text,text);
 drop function if exists public.create_companies_checked(jsonb,text);
 drop function if exists public.update_company_checked(uuid,jsonb,text);
-drop function if exists public.create_company_checked(text,text,text,text,text,text,text,text,text,text,boolean);
+drop function if exists public.create_company_checked(text,text,text,text,text,text,text,text,text,text);
 drop function if exists public.check_company_safety(text,text,text,text);
 
 -- 6. ビューを削除

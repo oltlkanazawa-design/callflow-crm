@@ -10,7 +10,24 @@
 -- ハードニングのみ、ロジックは無変更でCREATE OR REPLACEします）。
 --
 -- 適用前に必ず内容を確認し、承認を得てから実行してください。
--- このSQLは2回連続で実行しても安全なように作られています。
+--
+-- このファイルはマイグレーション管理下で1回だけ適用することを想定しています。
+-- CREATE TABLE等を含むため、誤って2回連続で実行した場合は「already exists」
+-- エラーで失敗しますが、begin/commitのトランザクション全体がロールバック
+-- されるため、中途半端な状態で一部だけ適用されることはありません
+-- （2026-07-18、隔離環境で実証済み）。ロールバック実行後にこのファイルを
+-- 再適用するケース（rollback-company-safety-stage-a.sql → 本ファイル）は
+-- 正常に完了することも別途確認済みです。
+--
+-- 全ての書き込み系RPC（create_company_checked / update_company_checked /
+-- create_companies_checked / block_company_calls / unblock_company_calls /
+-- record_call）は、必ず次の順序でロックを取得します。この順序を逆にする
+-- 実装を今後追加しないでください（デッドロック・レース条件の温床になります）。
+--   1. organization advisory lock（acquire_organization_lock）
+--   2. profileとorganizationの再確認（active状態・組織一致）
+--   3. registration advisory locks（電話/ドメイン/企業名+所在地。該当関数のみ）
+--   4. 対象企業・禁止状態・重複状態の再取得（ロック取得後の最新値で判定）
+--   5. 書き込み
 -- =========================================================
 
 begin;
@@ -19,6 +36,9 @@ begin;
 -- 0. 正規化関数（電話番号・ドメイン・企業名・所在地）
 --    既存のsrc/lib/csv-import.tsのnormalizePhone/urlDomain/normalizeNameと
 --    同等のロジックをSQL側にも持たせ、DB内の照合で共通利用する。
+--    企業名の正規化では、株式会社／(株)／（株）／㈱ などの法人格の表記揺れも
+--    同一形式へ統一する（法人格そのものを削除すると誤検出が広がるため、
+--    明確な表記差だけを吸収する）。
 -- ---------------------------------------------------------
 
 create or replace function public.normalize_phone(p_raw text) returns text
@@ -46,14 +66,30 @@ as $$
   )
 $$;
 
+-- 法人格の表記揺れ（株式会社／(株)／（株）／㈱ など）を同一形式へ正規化してから
+-- 空白除去・小文字化する。法人格そのものを削除すると別の企業と誤って一致する
+-- 範囲が広がるため、明確な表記差だけを吸収する（TypeScript側のnormalizeName
+-- と同じ変換内容・同じ優先順位で実装すること）。
 create or replace function public.normalize_company_name(p_raw text) returns text
-language sql
+language plpgsql
 immutable
 set search_path = ''
 as $$
-  select pg_catalog.lower(pg_catalog.regexp_replace(
-    pg_catalog.translate(pg_catalog.btrim(coalesce(p_raw, '')), '　', ' '), '\s+', '', 'g'
-  ))
+declare
+  v_result text := pg_catalog.btrim(coalesce(p_raw, ''));
+begin
+  v_result := pg_catalog.regexp_replace(v_result, '\(株\)', '株式会社', 'g');
+  v_result := pg_catalog.regexp_replace(v_result, '（株）', '株式会社', 'g');
+  v_result := pg_catalog.regexp_replace(v_result, '㈱', '株式会社', 'g');
+  v_result := pg_catalog.regexp_replace(v_result, '\(有\)', '有限会社', 'g');
+  v_result := pg_catalog.regexp_replace(v_result, '（有）', '有限会社', 'g');
+  v_result := pg_catalog.regexp_replace(v_result, '㈲', '有限会社', 'g');
+  v_result := pg_catalog.regexp_replace(v_result, '\(同\)', '合同会社', 'g');
+  v_result := pg_catalog.regexp_replace(v_result, '（同）', '合同会社', 'g');
+  v_result := pg_catalog.translate(v_result, '　', ' ');
+  v_result := pg_catalog.regexp_replace(v_result, '\s+', '', 'g');
+  return pg_catalog.lower(v_result);
+end;
 $$;
 
 create or replace function public.normalize_location(p_raw text) returns text
@@ -76,25 +112,32 @@ grant execute on function public.normalize_location(text) to authenticated;
 
 -- ---------------------------------------------------------
 -- 1. call_blocklist（架電禁止の唯一の正本）
+--    match_scopeは次の意味に厳密に統一する：
+--      phone         = 電話番号だけで一致
+--      domain        = ドメインだけで一致
+--      name_location = 企業名＋所在地だけで一致
+--      name_only     = 企業名だけで一致（誤検出範囲が広いため管理者が明示的に選んだ場合だけ）
+--      strict        = 電話・ドメイン・企業名+所在地のうち利用可能な強一致キーのいずれかで一致
+--    正規化キーは、選択したmatch_scopeに必要な列だけを保存する
+--    （strictのみ、利用可能な強一致キーをすべて保存する）。
 -- ---------------------------------------------------------
 create table public.call_blocklist (
   id uuid primary key default gen_random_uuid(),
   organization_id uuid not null references public.organizations(id) on delete cascade,
   company_id uuid references public.companies(id) on delete set null,
 
-  -- 元データのスナップショット（企業が削除・変更されても消えない）
+  -- 元データのスナップショット（企業が削除・変更されても消えない。scopeに関わらず保存する）
   snapshot_name text,
   snapshot_location text,
   snapshot_phone text,
   snapshot_domain text,
 
-  -- 正規化済み照合キー
+  -- 正規化済み照合キー（match_scopeに応じて必要な列だけをNOT NULLにする）
   normalized_name text,
   normalized_location text,
   normalized_phone text,
   normalized_domain text,
 
-  -- 'strict' = 電話/ドメイン/名前+所在地のみで照合。'name_only' = 管理者が明示的に選んだ場合だけ
   match_scope text not null default 'strict' check (match_scope in ('phone','domain','name_location','name_only','strict')),
 
   reason text not null,
@@ -106,11 +149,28 @@ create table public.call_blocklist (
   updated_by uuid references public.profiles(id) on delete set null,
   updated_at timestamptz not null default now(),
 
-  constraint call_blocklist_has_identifier check (
-    normalized_phone is not null
-    or normalized_domain is not null
-    or (normalized_name is not null and normalized_location is not null)
-    or (match_scope = 'name_only' and normalized_name is not null)
+  -- match_scopeごとに、保存してよい正規化キーの組み合わせを厳密に制約する。
+  -- 例えばphoneスコープの行にnormalized_domainが紛れ込むと、意図せずドメイン一致でも
+  -- ヒットしてしまうため、スコープに無関係な列は必ずNULLでなければならない。
+  constraint call_blocklist_scope_columns check (
+    case match_scope
+      when 'phone' then
+        normalized_phone is not null
+        and normalized_domain is null and normalized_name is null and normalized_location is null
+      when 'domain' then
+        normalized_domain is not null
+        and normalized_phone is null and normalized_name is null and normalized_location is null
+      when 'name_location' then
+        normalized_name is not null and normalized_location is not null
+        and normalized_phone is null and normalized_domain is null
+      when 'name_only' then
+        normalized_name is not null and normalized_location is null
+        and normalized_phone is null and normalized_domain is null
+      when 'strict' then
+        normalized_phone is not null or normalized_domain is not null
+        or (normalized_name is not null and normalized_location is not null)
+      else false
+    end
   )
 );
 
@@ -118,6 +178,7 @@ create index call_blocklist_org_idx on public.call_blocklist(organization_id);
 create index call_blocklist_company_idx on public.call_blocklist(company_id) where company_id is not null;
 
 -- 同じ禁止キーの多重登録防止：有効な行は識別子ごとに常に1件だけ
+-- （strictスコープの行も同じ列に値を持つため、同じインデックスで一意性を共有する）
 create unique index call_blocklist_phone_unique
   on public.call_blocklist(organization_id, normalized_phone)
   where active and normalized_phone is not null;
@@ -179,6 +240,8 @@ grant select on table public.call_blocklist_audit to authenticated;
 -- 3. match_active_blocklist()：架電禁止判定の唯一の共通関数
 --    該当する有効な禁止設定があれば1行、無ければ0行を返す。
 --    security invoker（既定）：call_blocklistの既存SELECT RLSがそのまま適用される。
+--    保存されている列の非NULLだけに頼らず、match_scopeそのものも必ず確認する
+--    （多層防御：スコープ列制約が万一破られても、ここで意図しない一致を防ぐ）。
 -- ---------------------------------------------------------
 create or replace function public.match_active_blocklist(
   p_organization_id uuid, p_phone text, p_domain text, p_name text, p_location text
@@ -191,11 +254,15 @@ as $$
   from public.call_blocklist b
   cross join lateral (
     select case
-      when p_phone <> '' and b.normalized_phone = p_phone then 'phone'
-      when p_domain <> '' and b.normalized_domain = p_domain then 'domain'
-      when b.match_scope <> 'name_only' and p_location <> '' and p_name <> ''
+      when b.match_scope in ('phone','strict') and p_phone <> '' and b.normalized_phone is not null
+        and b.normalized_phone = p_phone then 'phone'
+      when b.match_scope in ('domain','strict') and p_domain <> '' and b.normalized_domain is not null
+        and b.normalized_domain = p_domain then 'domain'
+      when b.match_scope in ('name_location','strict') and p_name <> '' and p_location <> ''
+        and b.normalized_name is not null and b.normalized_location is not null
         and b.normalized_name = p_name and b.normalized_location = p_location then 'name_location'
-      when b.match_scope = 'name_only' and p_name <> '' and b.normalized_name = p_name then 'name_only'
+      when b.match_scope = 'name_only' and p_name <> '' and b.normalized_name is not null
+        and b.normalized_name = p_name then 'name_only'
     end as scope
   ) mt
   where b.organization_id = p_organization_id and b.active and mt.scope is not null
@@ -207,8 +274,8 @@ revoke all on function public.match_active_blocklist(uuid,text,text,text,text) f
 grant execute on function public.match_active_blocklist(uuid,text,text,text,text) to authenticated;
 
 -- ---------------------------------------------------------
--- 4. 組織単位のロック関数（record_call / block_company_calls / unblock_company_callsが
---    まったく同じ方式・同じキーで直列化するための共通関数）
+-- 4. 組織単位のロック関数（企業を書き込む全RPCが、必ず最初にこの関数で
+--    同じキーを取得し、直列化するための共通関数）
 --
 --    【重要】public.organizationsに対するSELECT ... FOR UPDATEは、authenticatedロールに
 --    UPDATE系の権限が無いため permission denied for table organizations で失敗することを
@@ -231,6 +298,7 @@ grant execute on function public.acquire_organization_lock(uuid) to authenticate
 -- ---------------------------------------------------------
 -- 5. 企業登録時の複数キーadvisory lock（電話・ドメイン・企業名+所在地のうち
 --    存在するものすべてを、常に同じ昇順で取得しデッドロックを防ぐ）。
+--    必ずacquire_organization_lock()の後に呼び出すこと。
 --    security definer関数の内部だけから呼ばれるため、外部への実行権限は一切付与しない。
 -- ---------------------------------------------------------
 create or replace function public.acquire_registration_locks(
@@ -268,6 +336,9 @@ revoke all on function public.acquire_registration_locks(uuid,text,text,text,tex
 -- ---------------------------------------------------------
 -- 6. companies_with_call_status：SECURITY INVOKERビュー
 --    companies / call_blocklist それぞれの既存RLSがそのまま適用される。
+--    security_invoker=trueを明示しないと、PostgreSQLの既定挙動により
+--    ビュー所有者の権限でRLSが評価され、組織を越えて全件が見えてしまう
+--    （2026-07-18、隔離テスト環境で実際に確認・修正）。
 --    同じ企業に複数の一致理由があっても、match_active_blocklistがLIMIT 1で
 --    1件だけ返すため、企業行が重複表示されることはない。
 -- ---------------------------------------------------------
@@ -371,13 +442,16 @@ grant execute on function public.check_company_safety(text,text,text,text) to au
 
 -- ---------------------------------------------------------
 -- 8. create_company_checked()：確認と保存を1トランザクションで統一
+--    禁止先に一致した企業は、いかなる引数によっても登録を迂回できない
+--    （p_acknowledge_blocklistのような迂回引数は存在しない）。
+--    ロック順序：organization lock → profile再確認 → registration locks →
+--                禁止状態・重複状態の再取得 → 書き込み
 -- ---------------------------------------------------------
 create or replace function public.create_company_checked(
   p_name text, p_phone text, p_website_url text, p_location text,
   p_industry text default '', p_contact_name text default '', p_email text default null,
   p_memo text default '', p_list_source text default null,
-  p_on_duplicate text default 'skip',          -- 'skip' | 'update' | 'insert'
-  p_acknowledge_blocklist boolean default false
+  p_on_duplicate text default 'skip'          -- 'skip' | 'update' | 'insert'
 ) returns jsonb
 language plpgsql
 security definer
@@ -390,38 +464,46 @@ declare
   v_dup_company public.companies;
   v_new_company public.companies;
 begin
+  -- 0. duplicate modeの検証（重複が見つかるかどうかに関わらず、最初に検証する）
+  if p_on_duplicate not in ('skip','update','insert') then
+    raise exception 'invalid_on_duplicate';
+  end if;
+
   -- 1. 認証確認
   v_caller := auth.uid();
   if v_caller is null then raise exception 'not_authenticated'; end if;
 
-  -- 2. 所属組織の仮取得
+  -- 2. 所属組織の仮取得（ロックのキーを知るためだけの参照。書き込み判断には使わない）
   select organization_id into v_caller_org from public.profiles where id = v_caller;
   if v_caller_org is null then raise exception 'not_authorized'; end if;
 
-  -- 3. 入力値の正規化
-  v_norm_phone := public.normalize_phone(p_phone);
-  v_norm_domain := public.normalize_domain(p_website_url);
-  v_norm_name := public.normalize_company_name(p_name);
-  v_norm_location := public.normalize_location(p_location);
+  -- 3. organization advisory lock（他の全書き込みRPCと共通のキー・共通の取得順）
+  perform public.acquire_organization_lock(v_caller_org);
 
-  -- 4. registration advisory lock（適用可能な全キーを昇順で取得）
-  perform public.acquire_registration_locks(v_caller_org, v_norm_phone, v_norm_domain, v_norm_name, v_norm_location);
-
-  -- 呼び出し元profileを再取得し、active状態を確認
+  -- 4. ロック取得後にprofileを再取得し、active状態を確認
   select * into v_caller_profile from public.profiles where id = v_caller;
   if v_caller_profile.active <> true or v_caller_profile.organization_id <> v_caller_org then
     raise exception 'account_inactive';
   end if;
 
-  if v_norm_name = '' then raise exception 'name_required'; end if;
+  if pg_catalog.btrim(coalesce(p_name,'')) = '' then raise exception 'name_required'; end if;
 
-  -- 5. 最新状態で禁止先照合
+  -- 5. 入力値の正規化
+  v_norm_phone := public.normalize_phone(p_phone);
+  v_norm_domain := public.normalize_domain(p_website_url);
+  v_norm_name := public.normalize_company_name(p_name);
+  v_norm_location := public.normalize_location(p_location);
+
+  -- 6. registration advisory lock（適用可能な全キーを昇順で取得）
+  perform public.acquire_registration_locks(v_caller_org, v_norm_phone, v_norm_domain, v_norm_name, v_norm_location);
+
+  -- 7. ロック取得後、最新状態で禁止先照合。一致すれば理由の如何を問わず登録しない
   select * into v_block from public.match_active_blocklist(v_caller_org, v_norm_phone, v_norm_domain, v_norm_name, v_norm_location);
-  if found and not p_acknowledge_blocklist then
+  if found then
     return jsonb_build_object('status','blocked','blocklist_id',v_block.blocklist_id,'matched_scope',v_block.matched_scope,'reason',v_block.reason);
   end if;
 
-  -- 6. 最新状態で重複候補照合
+  -- 8. 最新状態で重複候補照合
   select c.* into v_dup_company from public.companies c
     where c.organization_id = v_caller_org
       and (
@@ -431,12 +513,7 @@ begin
       )
     limit 1;
 
-  -- 7. duplicate modeの検証
-  if found and p_on_duplicate not in ('skip','update','insert') then
-    raise exception 'invalid_on_duplicate';
-  end if;
-
-  -- 8. insert/update/skip/blockedを決定
+  -- 9. insert/skip/needs_explicit_updateを決定
   if found and p_on_duplicate = 'skip' then
     return jsonb_build_object('status','skipped','existing_company_id',v_dup_company.id);
   end if;
@@ -444,7 +521,7 @@ begin
     return jsonb_build_object('status','needs_explicit_update','existing_company_id',v_dup_company.id);
   end if;
 
-  -- 9. 書き込み
+  -- 10. 書き込み
   insert into public.companies(
     organization_id, name, industry, location, phone, website_url, list_source,
     contact_name, email, memo, heat, owner_id
@@ -453,16 +530,18 @@ begin
     coalesce(p_contact_name,''), p_email, coalesce(p_memo,''), '低', v_caller
   ) returning * into v_new_company;
 
-  -- 10. 構造化結果を返す
+  -- 11. 構造化結果を返す
   return jsonb_build_object('status','inserted','company',to_jsonb(v_new_company));
 end;
 $$;
 
-revoke all on function public.create_company_checked(text,text,text,text,text,text,text,text,text,text,boolean) from public, anon, authenticated;
-grant execute on function public.create_company_checked(text,text,text,text,text,text,text,text,text,text,boolean) to authenticated;
+revoke all on function public.create_company_checked(text,text,text,text,text,text,text,text,text,text) from public, anon, authenticated;
+grant execute on function public.create_company_checked(text,text,text,text,text,text,text,text,text,text) to authenticated;
 
 -- ---------------------------------------------------------
 -- 9. update_company_checked()
+--    ロック順序：organization lock → profile再確認 → 対象企業の再取得 →
+--                registration locks → 禁止状態・重複状態の再取得 → 書き込み
 -- ---------------------------------------------------------
 create or replace function public.update_company_checked(
   p_company_id uuid, p_patch jsonb, p_on_duplicate text default 'skip'
@@ -483,15 +562,30 @@ declare
   v_key text;
   v_safe_patch jsonb;
 begin
+  -- 0. duplicate modeの検証
+  if p_on_duplicate not in ('skip','update','insert') then
+    raise exception 'invalid_on_duplicate';
+  end if;
+
+  -- 1. 認証確認
   v_caller := auth.uid();
   if v_caller is null then raise exception 'not_authenticated'; end if;
+
+  -- 2. 所属組織の仮取得
   select organization_id into v_caller_org from public.profiles where id = v_caller;
   if v_caller_org is null then raise exception 'not_authorized'; end if;
+
+  -- 3. organization advisory lock
+  perform public.acquire_organization_lock(v_caller_org);
+
+  -- 4. ロック取得後にprofileを再確認
   select * into v_caller_profile from public.profiles where id = v_caller;
   if v_caller_profile.active <> true or v_caller_profile.organization_id <> v_caller_org then
     raise exception 'account_inactive';
   end if;
 
+  -- 5. ロック取得後に対象企業を再取得する（他の書き込みRPCも同じorganization lockを
+  --    取得してからでないと対象企業を書き換えられないため、ここでの取得値は最新）
   select * into v_target from public.companies where id = p_company_id and organization_id = v_caller_org;
   if not found then raise exception 'company_not_found_in_your_organization'; end if;
 
@@ -501,25 +595,29 @@ begin
     v_safe_patch := v_safe_patch - v_key;
   end loop;
 
-  v_new_name := coalesce(v_safe_patch->>'name', v_target.name);
-  v_new_phone := coalesce(v_safe_patch->>'phone', v_target.phone);
+  v_new_name := coalesce(nullif(v_safe_patch->>'name',''), v_target.name);
+  v_new_phone := coalesce(nullif(v_safe_patch->>'phone',''), v_target.phone);
   v_new_website_url := coalesce(v_safe_patch->>'website_url', v_target.website_url);
-  v_new_location := coalesce(v_safe_patch->>'location', v_target.location);
+  v_new_location := coalesce(nullif(v_safe_patch->>'location',''), v_target.location);
+
+  if pg_catalog.btrim(coalesce(v_new_name,'')) = '' then raise exception 'name_required'; end if;
 
   v_norm_phone := public.normalize_phone(v_new_phone);
   v_norm_domain := public.normalize_domain(v_new_website_url);
   v_norm_name := public.normalize_company_name(v_new_name);
   v_norm_location := public.normalize_location(v_new_location);
 
+  -- 6. registration advisory lock
   perform public.acquire_registration_locks(v_caller_org, v_norm_phone, v_norm_domain, v_norm_name, v_norm_location);
 
-  -- 更新後の値で禁止・重複判定
+  -- 7. 更新後の実効値で禁止判定（空欄入力で既存の禁止一致キーを外して回避できないよう、
+  --    パッチが空欄の項目は既存値を引き継いだ実効値で判定する）
   select * into v_block from public.match_active_blocklist(v_caller_org, v_norm_phone, v_norm_domain, v_norm_name, v_norm_location);
   if found then
     return jsonb_build_object('status','blocked','blocklist_id',v_block.blocklist_id,'matched_scope',v_block.matched_scope,'reason',v_block.reason);
   end if;
 
-  -- 対象企業自身を重複候補から除外する
+  -- 8. 対象企業自身を除外して重複候補を再確認
   select c.* into v_dup_company from public.companies c
     where c.organization_id = v_caller_org and c.id <> p_company_id
       and (
@@ -537,6 +635,7 @@ begin
     return jsonb_build_object('status','needs_explicit_resolution','conflicting_company_id',v_dup_company.id);
   end if;
 
+  -- 9. 書き込み
   update public.companies set
     name = v_new_name,
     phone = v_new_phone,
@@ -559,6 +658,16 @@ grant execute on function public.update_company_checked(uuid,jsonb,text) to auth
 
 -- ---------------------------------------------------------
 -- 10. create_companies_checked()：CSV一括登録の部分成功方式
+--    organization advisory lockはバッチ開始時に1回だけ取得する（1行ごとに
+--    取得し直さない）。長時間のバッチ中にアカウントが無効化されるケースを
+--    検出できるよう、行ごとにactive状態を再確認する。
+--    各行のon_duplicateは処理前に必ず検証し、不正な値はinsert扱いにせず
+--    行単位のinvalid_on_duplicateエラーにする。
+--    update時は「重複先企業をロック後に再取得→実効値を合成→正規化→
+--    registration locks→実効値で禁止判定→重複再確認→更新」の順で処理し、
+--    空欄入力で既存の禁止一致キーを外したまま更新できないようにする。
+--    行エラーの結果には、安全なerror_codeのみを含め、Postgresの生エラー
+--    メッセージ（制約名・テーブル名・SQL・データ型を含みうる）は含めない。
 -- ---------------------------------------------------------
 create or replace function public.create_companies_checked(
   p_rows jsonb, p_default_on_duplicate text default 'skip'
@@ -576,12 +685,21 @@ declare
   v_seen_phones text[] := '{}'; v_seen_domains text[] := '{}'; v_seen_name_locs text[] := '{}';
   v_block record; v_dup_company public.companies; v_new_company public.companies; v_updated public.companies;
   v_on_duplicate text;
-  v_sqlstate text;
+  v_eff_name text; v_eff_phone text; v_eff_website_url text; v_eff_location text;
+  v_dup_after record;
 begin
+  -- 1. 認証確認
   v_caller := auth.uid();
   if v_caller is null then raise exception 'not_authenticated'; end if;
+
+  -- 2. 所属組織の仮取得
   select organization_id into v_caller_org from public.profiles where id = v_caller;
   if v_caller_org is null then raise exception 'not_authorized'; end if;
+
+  -- 3. organization advisory lock（バッチ全体で1回だけ）
+  perform public.acquire_organization_lock(v_caller_org);
+
+  -- 4. ロック取得後にprofileを再確認
   select * into v_caller_profile from public.profiles where id = v_caller;
   if v_caller_profile.active <> true or v_caller_profile.organization_id <> v_caller_org then
     raise exception 'account_inactive';
@@ -590,11 +708,24 @@ begin
   for v_row in select * from jsonb_array_elements(p_rows) loop
     v_idx := v_idx + 1;
     begin  -- PL/pgSQLの例外ブロックはSAVEPOINT相当。1行の失敗が他行を巻き込まない
+
+      -- 長時間バッチ中のアカウント無効化を検出するため、行ごとに再確認する
+      select * into v_caller_profile from public.profiles where id = v_caller;
+      if v_caller_profile.active <> true or v_caller_profile.organization_id <> v_caller_org then
+        raise exception 'account_inactive';
+      end if;
+
+      v_on_duplicate := coalesce(v_row->>'on_duplicate', p_default_on_duplicate);
+      if v_on_duplicate not in ('skip','update','insert') then
+        v_row_result := jsonb_build_object('row', v_idx, 'status', 'error', 'error_code', 'invalid_on_duplicate');
+        v_results := v_results || jsonb_build_array(v_row_result);
+        continue;
+      end if;
+
       v_norm_phone := public.normalize_phone(v_row->>'phone');
       v_norm_domain := public.normalize_domain(v_row->>'website_url');
       v_norm_name := public.normalize_company_name(v_row->>'name');
       v_norm_location := public.normalize_location(v_row->>'location');
-      v_on_duplicate := coalesce(v_row->>'on_duplicate', p_default_on_duplicate);
 
       if v_norm_name = '' then
         v_row_result := jsonb_build_object('row', v_idx, 'status', 'error', 'error_code', 'name_required');
@@ -637,12 +768,65 @@ begin
 
       if found and v_on_duplicate = 'skip' then
         v_row_result := jsonb_build_object('row', v_idx, 'status', 'skipped', 'existing_company_id', v_dup_company.id);
+
       elsif found and v_on_duplicate = 'update' then
+        -- 1. 重複先企業をロック後に再取得（organization lockで直列化済みのため、
+        --    ここでの再取得値が最新。行ロックも重ねて明示的に取得する）
+        select * into v_dup_company from public.companies where id = v_dup_company.id for update;
+
+        -- 2. CSVの値と既存値を統合し、更新後の実効値を作る
+        --    （空欄のCSV項目は既存値のまま＝既存の禁止一致キーを空欄入力で
+        --    外して禁止判定を回避できないようにする）
+        v_eff_name := coalesce(nullif(v_row->>'name',''), v_dup_company.name);
+        v_eff_phone := coalesce(nullif(v_row->>'phone',''), v_dup_company.phone);
+        v_eff_website_url := coalesce(nullif(v_row->>'website_url',''), v_dup_company.website_url);
+        v_eff_location := coalesce(nullif(v_row->>'location',''), v_dup_company.location);
+
+        -- 3. 実効値を正規化
+        v_norm_phone := public.normalize_phone(v_eff_phone);
+        v_norm_domain := public.normalize_domain(v_eff_website_url);
+        v_norm_name := public.normalize_company_name(v_eff_name);
+        v_norm_location := public.normalize_location(v_eff_location);
+
+        -- 4. 実効値に基づくregistration locksを取得
+        perform public.acquire_registration_locks(v_caller_org, v_norm_phone, v_norm_domain, v_norm_name, v_norm_location);
+
+        -- 5. 実効値でmatch_active_blocklist()を実行
+        select * into v_block from public.match_active_blocklist(v_caller_org, v_norm_phone, v_norm_domain, v_norm_name, v_norm_location);
+        if found then
+          -- 6. 禁止一致なら更新せずblockedを返す
+          v_row_result := jsonb_build_object('row', v_idx, 'status', 'blocked', 'blocklist_id', v_block.blocklist_id, 'matched_scope', v_block.matched_scope);
+          v_results := v_results || jsonb_build_array(v_row_result);
+          if v_norm_phone <> '' then v_seen_phones := array_append(v_seen_phones, v_norm_phone); end if;
+          if v_norm_domain <> '' then v_seen_domains := array_append(v_seen_domains, v_norm_domain); end if;
+          if v_norm_name <> '' and v_norm_location <> '' then v_seen_name_locs := array_append(v_seen_name_locs, v_norm_name||'|'||v_norm_location); end if;
+          continue;
+        end if;
+
+        -- 7. 重複状態を最新値で再確認（対象自身は除外）
+        select c.* into v_dup_after from public.companies c
+          where c.organization_id = v_caller_org and c.id <> v_dup_company.id
+            and (
+              (v_norm_phone <> '' and public.normalize_phone(c.phone) = v_norm_phone)
+              or (v_norm_domain <> '' and public.normalize_domain(c.website_url) = v_norm_domain)
+              or (v_norm_location <> '' and public.normalize_company_name(c.name) = v_norm_name and public.normalize_location(c.location) = v_norm_location)
+            )
+          limit 1;
+        if found then
+          v_row_result := jsonb_build_object('row', v_idx, 'status', 'skipped', 'reason', 'duplicate_conflict', 'conflicting_company_id', v_dup_after.company_id);
+          v_results := v_results || jsonb_build_array(v_row_result);
+          if v_norm_phone <> '' then v_seen_phones := array_append(v_seen_phones, v_norm_phone); end if;
+          if v_norm_domain <> '' then v_seen_domains := array_append(v_seen_domains, v_norm_domain); end if;
+          if v_norm_name <> '' and v_norm_location <> '' then v_seen_name_locs := array_append(v_seen_name_locs, v_norm_name||'|'||v_norm_location); end if;
+          continue;
+        end if;
+
+        -- 8. 更新
         update public.companies set
-          name = coalesce(nullif(v_row->>'name',''), name),
-          phone = coalesce(nullif(v_row->>'phone',''), phone),
-          website_url = coalesce(nullif(v_row->>'website_url',''), website_url),
-          location = coalesce(nullif(v_row->>'location',''), location),
+          name = v_eff_name,
+          phone = v_eff_phone,
+          website_url = nullif(v_eff_website_url,''),
+          location = v_eff_location,
           industry = coalesce(nullif(v_row->>'industry',''), industry),
           contact_name = coalesce(nullif(v_row->>'contact_name',''), contact_name),
           email = coalesce(nullif(v_row->>'email',''), email),
@@ -650,6 +834,7 @@ begin
           list_source = coalesce(nullif(v_row->>'list_source',''), list_source)
         where id = v_dup_company.id returning * into v_updated;
         v_row_result := jsonb_build_object('row', v_idx, 'status', 'updated', 'company_id', v_updated.id);
+
       else
         insert into public.companies(organization_id, name, industry, location, phone, website_url, list_source, contact_name, email, memo, heat, owner_id)
         values (v_caller_org, v_row->>'name', coalesce(v_row->>'industry',''), v_row->>'location', v_row->>'phone', nullif(v_row->>'website_url',''),
@@ -667,9 +852,19 @@ begin
       -- トランザクション全体を再試行すべき障害は行エラーへ握りつぶさず、そのまま再送出する
       when deadlock_detected or lock_not_available or query_canceled or serialization_failure then
         raise;
+      -- Postgresの生メッセージ（制約名・テーブル名・SQL・データ型を含みうる）は
+      -- 一切JSONへ入れず、安全な分類済みerror_codeだけを返す
+      when unique_violation then
+        v_row_result := jsonb_build_object('row', v_idx, 'status', 'error', 'error_code', 'duplicate_key');
+        v_results := v_results || jsonb_build_array(v_row_result);
+      when not_null_violation or check_violation or invalid_text_representation then
+        v_row_result := jsonb_build_object('row', v_idx, 'status', 'error', 'error_code', 'invalid_value');
+        v_results := v_results || jsonb_build_array(v_row_result);
+      when string_data_right_truncation then
+        v_row_result := jsonb_build_object('row', v_idx, 'status', 'error', 'error_code', 'value_too_long');
+        v_results := v_results || jsonb_build_array(v_row_result);
       when others then
-        get stacked diagnostics v_sqlstate = returned_sqlstate;
-        v_row_result := jsonb_build_object('row', v_idx, 'status', 'error', 'error_code', v_sqlstate, 'error_message', sqlerrm);
+        v_row_result := jsonb_build_object('row', v_idx, 'status', 'error', 'error_code', 'row_save_failed');
         v_results := v_results || jsonb_build_array(v_row_result);
     end;
   end loop;
@@ -683,6 +878,12 @@ grant execute on function public.create_companies_checked(jsonb,text) to authent
 
 -- ---------------------------------------------------------
 -- 11. block_company_calls() / unblock_company_calls()：管理者専用
+--    p_match_scopeの意味を厳密に適用する。指定したscopeに必要な識別子が
+--    空の場合は登録せずエラーにする（例：電話番号が空の企業をphoneスコープで
+--    禁止することはできない）。正規化キーは、選択したscopeに必要な列だけを
+--    保存する（strictのみ、利用可能な強一致キーをすべて保存する）。
+--    unblock_company_calls()は同じblocklist_idを2回解除しても技術エラーに
+--    せず、冪等に振る舞う。
 -- ---------------------------------------------------------
 create or replace function public.block_company_calls(
   p_company_id uuid default null,
@@ -707,6 +908,9 @@ begin
   v_caller := auth.uid();
   if v_caller is null then raise exception 'not_authenticated'; end if;
   if p_reason is null or pg_catalog.btrim(p_reason) = '' then raise exception 'reason_required'; end if;
+  if p_match_scope not in ('phone','domain','name_location','name_only','strict') then
+    raise exception 'invalid_match_scope';
+  end if;
 
   -- 2. 呼び出し元組織の仮取得
   select organization_id into v_caller_org from public.profiles where id = v_caller;
@@ -722,7 +926,9 @@ begin
     raise exception 'not_authorized';
   end if;
 
-  -- 6. 対象企業または入力キーを再取得・正規化
+  -- 6. 対象企業または入力キーを、ロック取得後に再取得・正規化する
+  --    （更新との競合により古い電話番号やドメインを禁止しないよう、companyは
+  --    ここで初めて取得する）
   if p_company_id is not null then
     select * into v_company from public.companies where id = p_company_id and organization_id = v_caller_org;
     if not found then raise exception 'company_not_found_in_your_organization'; end if;
@@ -737,25 +943,36 @@ begin
     v_norm_location := public.normalize_location(coalesce(p_location,''));
   end if;
 
-  if v_norm_phone = '' and v_norm_domain = '' and not (v_norm_name <> '' and (v_norm_location <> '' or p_match_scope = 'name_only')) then
+  -- 7. scopeごとに必要な識別子が揃っているか検証する
+  if p_match_scope = 'phone' and v_norm_phone = '' then raise exception 'phone_required_for_scope'; end if;
+  if p_match_scope = 'domain' and v_norm_domain = '' then raise exception 'domain_required_for_scope'; end if;
+  if p_match_scope = 'name_location' and (v_norm_name = '' or v_norm_location = '') then raise exception 'name_and_location_required_for_scope'; end if;
+  if p_match_scope = 'name_only' and v_norm_name = '' then raise exception 'name_required_for_scope'; end if;
+  if p_match_scope = 'strict' and v_norm_phone = '' and v_norm_domain = ''
+     and not (v_norm_name <> '' and v_norm_location <> '') then
     raise exception 'identifier_required';
   end if;
 
-  -- 7. 最新の禁止状態を確認（同じ有効な行が既にあれば安全に返す＝繰り返し操作対策）
+  -- 8. 同じscopeで既に有効な禁止設定があれば、安全に同じ行を返す（繰り返し操作対策）
   select * into v_entry from public.call_blocklist
-    where organization_id = v_caller_org and active
+    where organization_id = v_caller_org and active and match_scope = p_match_scope
       and (
-        (v_norm_phone <> '' and normalized_phone = v_norm_phone)
-        or (v_norm_domain <> '' and normalized_domain = v_norm_domain)
-        or (p_match_scope <> 'name_only' and v_norm_name <> '' and v_norm_location <> '' and normalized_name = v_norm_name and normalized_location = v_norm_location)
-        or (p_match_scope = 'name_only' and v_norm_name <> '' and match_scope = 'name_only' and normalized_name = v_norm_name)
+        (p_match_scope = 'phone' and normalized_phone = v_norm_phone)
+        or (p_match_scope = 'domain' and normalized_domain = v_norm_domain)
+        or (p_match_scope = 'name_location' and normalized_name = v_norm_name and normalized_location = v_norm_location)
+        or (p_match_scope = 'name_only' and normalized_name = v_norm_name)
+        or (p_match_scope = 'strict' and (
+              (v_norm_phone <> '' and normalized_phone = v_norm_phone)
+              or (v_norm_domain <> '' and normalized_domain = v_norm_domain)
+              or (v_norm_name <> '' and v_norm_location <> '' and normalized_name = v_norm_name and normalized_location = v_norm_location)
+           ))
       )
     limit 1;
   if found then
-    return v_entry; -- 既に禁止済み。安全に同じ行を返す
+    return v_entry;
   end if;
 
-  -- 8. call_blocklistへ追加
+  -- 9. call_blocklistへ追加（scopeに必要な正規化キーだけを保存する）
   insert into public.call_blocklist(
     organization_id, company_id, snapshot_name, snapshot_location, snapshot_phone, snapshot_domain,
     normalized_name, normalized_location, normalized_phone, normalized_domain,
@@ -764,11 +981,14 @@ begin
     v_caller_org, p_company_id,
     coalesce(v_company.name, p_name), coalesce(v_company.location, p_location),
     coalesce(v_company.phone, p_phone), coalesce(v_company.website_url, p_website_url),
-    nullif(v_norm_name,''), nullif(v_norm_location,''), nullif(v_norm_phone,''), nullif(v_norm_domain,''),
+    case when p_match_scope in ('name_location','name_only','strict') then nullif(v_norm_name,'') else null end,
+    case when p_match_scope in ('name_location','strict') then nullif(v_norm_location,'') else null end,
+    case when p_match_scope in ('phone','strict') then nullif(v_norm_phone,'') else null end,
+    case when p_match_scope in ('domain','strict') then nullif(v_norm_domain,'') else null end,
     p_match_scope, p_reason, v_caller, v_caller
   ) returning * into v_entry;
 
-  -- 9. 監査履歴へ追加
+  -- 10. 監査履歴へ追加
   insert into public.call_blocklist_audit(
     organization_id, blocklist_id, company_id, action, reason, actor_id,
     snapshot_name, snapshot_location, snapshot_phone, snapshot_domain,
@@ -779,7 +999,7 @@ begin
     v_entry.normalized_name, v_entry.normalized_location, v_entry.normalized_phone, v_entry.normalized_domain, v_entry.match_scope
   );
 
-  -- 10. 結果を返す
+  -- 11. 結果を返す
   return v_entry;
 exception
   when unique_violation then
@@ -818,12 +1038,18 @@ begin
     raise exception 'not_authorized';
   end if;
 
-  -- 対象組織以外のblocklist_idは、organization_id条件で最初から見えない
+  -- 対象組織以外・存在しないblocklist_idはnot foundとして扱う（activeかどうかは問わない。
+  -- 冪等な解除を許可するため）
   select * into v_entry from public.call_blocklist
-    where id = p_blocklist_id and organization_id = v_caller_org and active
+    where id = p_blocklist_id and organization_id = v_caller_org
     for update;
   if not found then
     raise exception 'blocklist_entry_not_found';
+  end if;
+
+  -- 既に解除済みなら、技術エラーにせず同じ行を安全に返す（監査ログは重複追加しない）
+  if not v_entry.active then
+    return v_entry;
   end if;
 
   update public.call_blocklist
@@ -903,7 +1129,7 @@ grant execute on function public.scan_duplicate_candidates() to authenticated;
 -- ---------------------------------------------------------
 -- 13. record_call() の置き換え（既存オブジェクト変更・その1）
 --    署名・返り値・security invoker は維持。ロジックへ架電禁止チェックと
---    組織単位のadvisory lockを追加する。
+--    組織単位のadvisory lockを追加する（他の全書き込みRPCと同じ順序・同じキー）。
 -- ---------------------------------------------------------
 create or replace function public.record_call(
   p_company_id uuid, p_result text, p_note text default '', p_transcript text default null,
@@ -927,7 +1153,7 @@ begin
   select organization_id into v_caller_org from public.profiles where id = v_caller;
   if v_caller_org is null then raise exception 'not_authorized'; end if;
 
-  -- 3. 組織ロック取得（block/unblock_company_callsと同じ方式・同じキー）
+  -- 3. 組織ロック取得（block/unblock_company_calls・create/update系と同じ方式・同じキー）
   perform public.acquire_organization_lock(v_caller_org);
 
   -- 4-5. profile再取得、active状態を再確認
@@ -966,13 +1192,20 @@ grant execute on function public.record_call(uuid,text,text,text,text,timestampt
 
 -- ---------------------------------------------------------
 -- 14. call_logsへの直接INSERT対策（新規RESTRICTIVEポリシー1件のみ追加。
---    既存permissiveポリシー "organization members insert logs" は変更しない）
+--    既存permissiveポリシー "organization members insert logs" は変更しない）。
+--    company_idが指すcompanyが、call_logs.organization_idと同じ組織に
+--    属していることも必須条件に含める（他組織企業のUUIDをcompany_idへ
+--    指定した直接INSERTを拒否するため）。
 -- ---------------------------------------------------------
 create policy "block call_logs insert for prohibited companies" on public.call_logs
   as restrictive
   for insert to authenticated
   with check (
-    not exists (
+    exists (
+      select 1 from public.companies c
+      where c.id = call_logs.company_id and c.organization_id = call_logs.organization_id
+    )
+    and not exists (
       select 1 from public.match_active_blocklist(
         call_logs.organization_id,
         (select public.normalize_phone(c.phone) from public.companies c where c.id = call_logs.company_id),
