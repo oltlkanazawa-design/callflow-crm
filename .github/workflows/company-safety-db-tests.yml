@@ -11,11 +11,22 @@ name: Company Safety DB Tests
 #     本番project refの参照 / SUPABASE_ACCESS_TOKEN / 本番DB URL / 本番用Secrets
 # - 実在する顧客データ・本番企業データは一切使用しない。テスト用の架空データのみ。
 # - ローカル環境の既定パスワード等はログに出さないようマスクする。
+#
+# mainへのpull_requestでも自動実行することで、マージ後の将来のPRでもRLS・RPC・
+# マイグレーション変更時にSQL検証が自動で走る、恒久的な回帰テストとして機能させる。
 
 on:
   push:
     branches:
       - feature/company-safety
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "supabase/**"
+      - "src/lib/company-safety*"
+      - "src/lib/data.ts"
+      - ".github/workflows/company-safety-db-tests.yml"
   workflow_dispatch: {}
 
 permissions:
@@ -147,6 +158,28 @@ jobs:
               raise exception 'FAIL: create_company_checked still exists after stage-A rollback';
             end if;
             raise notice 'PASS: stage-A rollback removed all new objects';
+          end $$;
+          -- 緊急ロールバックによってsearch_path=''等のセキュリティ強化が失われていないことを、
+          -- pg_procのproconfigから直接確認する（関数定義のテキストではなく実際のカタログ状態）。
+          do $$
+          declare v_cfg text[];
+          begin
+            select proconfig into v_cfg from pg_proc where proname='record_call' and pronamespace='public'::regnamespace;
+            if v_cfg is null or not ('search_path=' = any(v_cfg)) then
+              raise exception 'FAIL: stage-Aロールバック後、record_call()のsearch_pathがハードニングされていません（proconfig: %）', v_cfg;
+            end if;
+            select proconfig into v_cfg from pg_proc where proname='current_organization_id' and pronamespace='public'::regnamespace;
+            if v_cfg is null or not ('search_path=' = any(v_cfg)) then
+              raise exception 'FAIL: stage-Aロールバック後、current_organization_id()のsearch_pathがハードニングされていません（proconfig: %）', v_cfg;
+            end if;
+            raise notice 'PASS: stage-Aロールバック後もrecord_call()/current_organization_id()のsearch_path=''''ハードニングが維持されている';
+          end $$;
+          do $$
+          begin
+            if has_function_privilege('public', 'public.current_organization_id()', 'execute') then
+              raise exception 'FAIL: stage-Aロールバック後もpublicロールがcurrent_organization_id()を実行できてしまいます';
+            end if;
+            raise notice 'PASS: stage-Aロールバック後もcurrent_organization_id()へのpublic実行権限は復元されていない';
           end $$;
           SQL
 

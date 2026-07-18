@@ -44,11 +44,15 @@ begin
 end;
 $$;
 
--- 3. record_call()を段階A適用前のロジックへ戻す（署名・返り値・security invokerは維持）
+-- 3. record_call()を段階A適用前の「業務ロジック」へ戻す（署名・返り値・security invokerは維持）。
+--    ただし search_path='' 等のセキュリティ強化は、緊急ロールバックによって
+--    失われてはならないため、段階A適用前のsearch_path=publicへは戻さず、
+--    完全修飾＋search_path=''のまま維持する（段階A適用前はsearch_path=publicで
+--    bareなnow()呼び出しだったが、ここではpg_catalog.now()に修飾する）。
 create or replace function public.record_call(
   p_company_id uuid, p_result text, p_note text default '', p_transcript text default null,
   p_ai_summary text default null, p_next_action_at timestamptz default null, p_heat text default '低'
-) returns uuid language plpgsql security invoker set search_path=public as $$
+) returns uuid language plpgsql security invoker set search_path = '' as $$
 declare v_org uuid; v_log_id uuid;
 begin
   select organization_id into v_org from public.companies where id=p_company_id;
@@ -57,13 +61,14 @@ begin
   if p_heat not in ('高','中','低') then raise exception 'invalid heat'; end if;
   insert into public.call_logs(organization_id,company_id,caller_id,result,note,transcript,ai_summary,next_action_at)
   values(v_org,p_company_id,auth.uid(),p_result,coalesce(p_note,''),p_transcript,p_ai_summary,p_next_action_at) returning id into v_log_id;
-  update public.companies set heat=p_heat,memo=coalesce(nullif(p_note,''),memo),last_called_at=now(),next_action_at=p_next_action_at where id=p_company_id;
+  update public.companies set heat=p_heat,memo=coalesce(nullif(p_note,''),memo),last_called_at=pg_catalog.now(),next_action_at=p_next_action_at where id=p_company_id;
   return v_log_id;
 end $$;
 grant execute on function public.record_call(uuid,text,text,text,text,timestamptz,text) to authenticated;
 
--- 4. current_organization_id()を段階A適用前の定義へ戻す（ロジック自体は無変更のため実質的に同一）
-create or replace function public.current_organization_id() returns uuid language sql stable security definer set search_path=public as $$
+-- 4. current_organization_id()を段階A適用前のロジックへ戻す（ロジック自体は無変更のため
+--    実質的に同一）。search_path=''のハードニングは同様に維持し、publicへは戻さない。
+create or replace function public.current_organization_id() returns uuid language sql stable security definer set search_path = '' as $$
   select organization_id from public.profiles where id=auth.uid() and active=true
 $$;
 

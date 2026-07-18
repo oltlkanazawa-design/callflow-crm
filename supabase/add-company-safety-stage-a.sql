@@ -813,7 +813,7 @@ begin
             )
           limit 1;
         if found then
-          v_row_result := jsonb_build_object('row', v_idx, 'status', 'skipped', 'reason', 'duplicate_conflict', 'conflicting_company_id', v_dup_after.company_id);
+          v_row_result := jsonb_build_object('row', v_idx, 'status', 'skipped', 'reason', 'duplicate_conflict', 'conflicting_company_id', v_dup_after.id);
           v_results := v_results || jsonb_build_array(v_row_result);
           if v_norm_phone <> '' then v_seen_phones := array_append(v_seen_phones, v_norm_phone); end if;
           if v_norm_domain <> '' then v_seen_domains := array_append(v_seen_domains, v_norm_domain); end if;
@@ -863,9 +863,9 @@ begin
       when string_data_right_truncation then
         v_row_result := jsonb_build_object('row', v_idx, 'status', 'error', 'error_code', 'value_too_long');
         v_results := v_results || jsonb_build_array(v_row_result);
-      when others then
-        v_row_result := jsonb_build_object('row', v_idx, 'status', 'error', 'error_code', 'row_save_failed');
-        v_results := v_results || jsonb_build_array(v_row_result);
+      -- 意図的にWHEN OTHERSを置かない：上記で明示的に想定した業務エラー・制約エラー
+      -- 以外（undefined_column/undefined_table/undefined_function/insufficient_privilege
+      -- 等の未分類エラーを含む）は、行エラーへ変換せずそのまま呼び出し元へ再送出する
     end;
   end loop;
 
@@ -1088,12 +1088,14 @@ declare
 begin
   v_caller := auth.uid();
   if v_caller is null then raise exception 'not_authenticated'; end if;
-  select organization_id into v_caller_org from public.profiles where id = v_caller;
-  if v_caller_org is null then raise exception 'not_authorized'; end if;
+  -- organization_id・role・activeを1回のSELECTで同一スナップショットから取得し、
+  -- 判定の途中でプロフィール所属が変わる余地（TOCTOU）を無くす
   select * into v_caller_profile from public.profiles where id = v_caller;
-  if v_caller_profile.role <> 'admin' or v_caller_profile.active <> true then
+  if not found or v_caller_profile.organization_id is null
+     or v_caller_profile.role <> 'admin' or v_caller_profile.active <> true then
     raise exception 'not_authorized';
   end if;
+  v_caller_org := v_caller_profile.organization_id;
 
   return query
     select a.id, b.id, 'phone'::text

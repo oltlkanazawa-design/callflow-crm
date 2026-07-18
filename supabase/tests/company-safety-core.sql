@@ -6,7 +6,8 @@
 -- 部分成功、call_logsへの他組織company_id・禁止企業への直接INSERT拒否、
 -- 一般メンバーのblock/unblock拒否、call_blocklist_auditの直接改ざん拒否、
 -- 架電履歴のある企業の削除拒否、unblockの冪等性、行エラーに生のPostgres
--- メッセージが含まれないこと、を検証する。
+-- メッセージが含まれないこと、CSV一括updateの実効値が別企業と新規衝突した際に
+-- duplicate_conflict／正しいconflicting_company_idを返すこと、を検証する。
 --
 -- 「本来失敗すべき操作」は、bareなSQL文としては実行しない（ON_ERROR_STOP=1の
 -- もとでは、そこでスクリプト全体が停止してしまうため）。代わりにdo $$ ... $$
@@ -368,7 +369,57 @@ begin
   if v_def !~ 'when\s+deadlock_detected\s+or\s+lock_not_available\s+or\s+query_canceled\s+or\s+serialization_failure\s+then\s+raise;' then
     raise exception 'FAIL[T19]: create_companies_checked()にdeadlock/lock/timeout/serialization系エラーの再送出節が見当たりません';
   end if;
-  raise notice 'PASS[T19]: トランザクション致命的エラーの再送出節が関数定義に存在する';
+  if v_def ~* 'when\s+others\s+then' then
+    raise exception 'FAIL[T19]: create_companies_checked()に包括的なWHEN OTHERSが残っており、未知のエラーを行エラーへ握りつぶす恐れがあります';
+  end if;
+  raise notice 'PASS[T19]: トランザクション致命的エラーの再送出節が存在し、かつ未知のエラーを握りつぶすWHEN OTHERSは存在しない';
+end $$;
+
+\echo '=== T20: CSV一括updateで実効値が別の既存企業と新たに衝突した場合、duplicate_conflictとして正しくスキップされ、conflicting_company_idも正しい企業を指す ==='
+-- 企業10と企業11は、あらかじめ同一ドメインを共有した「未整理の重複」として直接
+-- seedする（電話番号は異なるため、企業10はphoneで一意に特定できる）。
+-- CSV行は企業10をphone一致で特定しつつ、website_urlを空欄にすることで、
+-- 実効値としては企業10が既に持つドメイン（＝企業11と同じ）が引き継がれ、
+-- 更新前には気づけない「実効値ベースの新規衝突」を発生させる。
+insert into public.companies (id, organization_id, name, phone, website_url, location, memo) values
+  ('c0000000-0000-0000-0000-000000000010','a0000000-0000-0000-0000-00000000000a','T20更新対象企業','080-2000-0001','https://t20-shared.example.com','テスト所在地X','元メモ'),
+  ('c0000000-0000-0000-0000-000000000011','a0000000-0000-0000-0000-00000000000a','T20衝突先企業','080-2000-0002','https://t20-shared.example.com','テスト所在地Y',null);
+
+set role authenticated;
+set request.jwt.claim.sub = 'a1111111-1111-1111-1111-111111111111';
+do $$
+declare v_result jsonb; v_row jsonb;
+begin
+  select public.create_companies_checked(
+    p_rows := $j$[{"name":"T20更新対象企業（更新後名）","phone":"080-2000-0001","website_url":"","location":"テスト所在地X","memo":"T20更新試行"}]$j$::jsonb,
+    p_default_on_duplicate := 'update'
+  ) into v_result;
+  v_row := v_result -> 'results' -> 0;
+  if v_row->>'status' <> 'skipped' or v_row->>'reason' <> 'duplicate_conflict' then
+    raise exception 'FAIL[T20]: 実効値の衝突がduplicate_conflictとして検出されませんでした（結果: %）', v_row;
+  end if;
+  if (v_row->>'conflicting_company_id')::uuid <> 'c0000000-0000-0000-0000-000000000011'::uuid then
+    raise exception 'FAIL[T20]: conflicting_company_idが衝突先企業（企業11）のIDと一致しません（結果: %）', v_row;
+  end if;
+  if v_row->>'error_code' = 'row_save_failed' then
+    raise exception 'FAIL[T20]: row_save_failedとして処理されてしまいました（v_dup_after.company_id等の不正な列参照が疑われます、結果: %）', v_row;
+  end if;
+  raise notice 'PASS[T20]: CSV一括updateの実効値衝突はduplicate_conflictとして正しく検出され、conflicting_company_idも正しい企業を指す';
+end $$;
+reset role;
+
+do $$
+declare v_a public.companies; v_b public.companies;
+begin
+  select * into v_a from public.companies where id='c0000000-0000-0000-0000-000000000010';
+  if v_a.name <> 'T20更新対象企業' or v_a.phone <> '080-2000-0001' or v_a.location <> 'テスト所在地X' or v_a.memo <> '元メモ' then
+    raise exception 'FAIL[T20-DB確認]: 衝突検出後にもかかわらず企業10（更新対象だった側）のデータが変更されています（%）', v_a;
+  end if;
+  select * into v_b from public.companies where id='c0000000-0000-0000-0000-000000000011';
+  if v_b.name <> 'T20衝突先企業' or v_b.phone <> '080-2000-0002' then
+    raise exception 'FAIL[T20-DB確認]: 企業11（衝突先）のデータが変更されています（%）', v_b;
+  end if;
+  raise notice 'PASS[T20-DB確認]: 企業10・企業11のデータはいずれも変更されていない';
 end $$;
 
 \echo '=== ALL CORE ASSERTIONS EXECUTED ==='
