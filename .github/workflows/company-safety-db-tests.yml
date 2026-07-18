@@ -193,7 +193,19 @@ jobs:
           set -euo pipefail
           psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/fixtures/ci-privileges-setup.sql
           psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/schema.sql
-          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-concurrency.sql
+          # company-safety-concurrency.sqlはdblinkで2本目のDB接続を張るため、
+          # 現在接続中のDB_URLと同じ資格情報を明示的に渡す（推測のパスワードに
+          # 依存しない）。値はログに出さないようマスクしてから-vで渡す。
+          DB_HOST=$(python3 -c "import sys,urllib.parse as p; u=p.urlparse(sys.argv[1]); print(u.hostname)" "$DB_URL")
+          DB_PORT=$(python3 -c "import sys,urllib.parse as p; u=p.urlparse(sys.argv[1]); print(u.port)" "$DB_URL")
+          DB_USER=$(python3 -c "import sys,urllib.parse as p; u=p.urlparse(sys.argv[1]); print(u.username)" "$DB_URL")
+          DB_PASS=$(python3 -c "import sys,urllib.parse as p; u=p.urlparse(sys.argv[1]); print(u.password or '')" "$DB_URL")
+          DB_NAME=$(python3 -c "import sys,urllib.parse as p; u=p.urlparse(sys.argv[1]); print((u.path or '/postgres').lstrip('/') or 'postgres')" "$DB_URL")
+          echo "::add-mask::$DB_PASS"
+          psql "$DB_URL" -v ON_ERROR_STOP=1 \
+            -v dblink_host="$DB_HOST" -v dblink_port="$DB_PORT" -v dblink_user="$DB_USER" \
+            -v dblink_password="$DB_PASS" -v dblink_dbname="$DB_NAME" \
+            -f supabase/tests/company-safety-concurrency.sql
 
       - name: Stop Supabase sandbox
         if: always()

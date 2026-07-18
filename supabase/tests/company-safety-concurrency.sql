@@ -27,6 +27,12 @@
 -- ローカル／隔離環境専用。本番Supabaseでは絶対に実行しないこと。
 --
 -- 【注意】このファイルはdblink拡張（Postgresの標準contrib）を使用する。
+-- dblinkは2本目のDB接続を自分自身へ張るため、実行時にpsql変数
+-- dblink_host / dblink_port / dblink_dbname / dblink_user / dblink_password
+-- を -v で渡すこと（現在接続中の資格情報と同じものを渡す。推測のパスワードに
+-- 依存しないため）。例：
+--   psql "$DB_URL" -v dblink_host=... -v dblink_port=... -v dblink_dbname=... \
+--        -v dblink_user=... -v dblink_password=... -f company-safety-concurrency.sql
 -- =========================================================
 
 \set ON_ERROR_STOP on
@@ -46,8 +52,16 @@ insert into public.companies (id, organization_id, name, phone, location, owner_
 
 -- 2本の別接続を張る（同じDB・同じユーザーだが、advisory lockはセッション/トランザクション
 -- ごとに独立するため、実際に別トランザクションとして競合させられる）
-select dblink_connect('conn_a', 'dbname=' || current_database());
-select dblink_connect('conn_b', 'dbname=' || current_database());
+select dblink_connect('conn_a',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
+select dblink_connect('conn_b',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
 
 \echo '=== 競合1: block_company_calls と create_company_checked の同時実行 ==='
 select dblink_exec('conn_a', 'set role authenticated');
@@ -72,8 +86,16 @@ begin
 end $$;
 
 \echo '=== 競合2: block_company_calls と update_company_checked の同時実行 ==='
-select dblink_connect('conn_a', 'dbname=' || current_database());
-select dblink_connect('conn_b', 'dbname=' || current_database());
+select dblink_connect('conn_a',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
+select dblink_connect('conn_b',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
 select dblink_exec('conn_a', 'set role authenticated');
 select dblink_exec('conn_a', $$set request.jwt.claim.sub = 'a1111111-1111-1111-1111-111111111111'$$);
 select dblink_exec('conn_a', 'begin');
@@ -101,8 +123,16 @@ begin
 end $$;
 
 \echo '=== 競合3: block_company_calls と create_companies_checked（CSV update）の同時実行 ==='
-select dblink_connect('conn_a', 'dbname=' || current_database());
-select dblink_connect('conn_b', 'dbname=' || current_database());
+select dblink_connect('conn_a',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
+select dblink_connect('conn_b',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
 select dblink_exec('conn_a', 'set role authenticated');
 select dblink_exec('conn_a', $$set request.jwt.claim.sub = 'a1111111-1111-1111-1111-111111111111'$$);
 select dblink_exec('conn_a', 'begin');
@@ -132,8 +162,16 @@ end $$;
 
 \echo '=== 競合4: unblock_company_calls と update_company_checked の同時実行 ==='
 select bl.id as blocklist_id_1 from public.call_blocklist bl where bl.company_id='c0000000-0000-0000-0000-000000000001' and bl.active \gset
-select dblink_connect('conn_a', 'dbname=' || current_database());
-select dblink_connect('conn_b', 'dbname=' || current_database());
+select dblink_connect('conn_a',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
+select dblink_connect('conn_b',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
 select dblink_exec('conn_a', 'set role authenticated');
 select dblink_exec('conn_a', $$set request.jwt.claim.sub = 'a1111111-1111-1111-1111-111111111111'$$);
 select dblink_exec('conn_a', 'begin');
@@ -161,8 +199,16 @@ begin
 end $$;
 
 \echo '=== 競合5: record_call と block_company_calls の同時実行 ==='
-select dblink_connect('conn_a', 'dbname=' || current_database());
-select dblink_connect('conn_b', 'dbname=' || current_database());
+select dblink_connect('conn_a',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
+select dblink_connect('conn_b',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
 select dblink_exec('conn_a', 'set role authenticated');
 select dblink_exec('conn_a', $$set request.jwt.claim.sub = 'a2222222-2222-2222-2222-222222222222'$$);
 select dblink_exec('conn_a', 'begin');
@@ -196,8 +242,16 @@ end $$;
 \echo '=== 競合6: unblock_company_calls と record_call の同時実行 ==='
 -- 企業2は競合5でブロック済み。それをunblockする側と、record_callを試みる側を競合させる。
 select bl.id as blocklist_id_2 from public.call_blocklist bl where bl.company_id='c0000000-0000-0000-0000-000000000002' and bl.active \gset
-select dblink_connect('conn_a', 'dbname=' || current_database());
-select dblink_connect('conn_b', 'dbname=' || current_database());
+select dblink_connect('conn_a',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
+select dblink_connect('conn_b',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
 select dblink_exec('conn_a', 'set role authenticated');
 select dblink_exec('conn_a', $$set request.jwt.claim.sub = 'a1111111-1111-1111-1111-111111111111'$$);
 select dblink_exec('conn_a', 'begin');
@@ -223,8 +277,16 @@ begin
 end $$;
 
 \echo '=== 競合7: 同一の新規識別子への同時登録（create_company_checked同士の競合） ==='
-select dblink_connect('conn_a', 'dbname=' || current_database());
-select dblink_connect('conn_b', 'dbname=' || current_database());
+select dblink_connect('conn_a',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
+select dblink_connect('conn_b',
+  'host=' || :'dblink_host' || ' port=' || :'dblink_port' ||
+  ' dbname=' || :'dblink_dbname' || ' user=' || :'dblink_user' ||
+  ' password=' || :'dblink_password'
+);
 select dblink_exec('conn_a', 'set role authenticated');
 select dblink_exec('conn_a', $$set request.jwt.claim.sub = 'a1111111-1111-1111-1111-111111111111'$$);
 select dblink_exec('conn_a', 'begin');
