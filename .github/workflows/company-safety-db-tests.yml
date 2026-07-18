@@ -33,7 +33,9 @@ jobs:
       - name: Setup Supabase CLI
         uses: supabase/setup-cli@v1
         with:
-          version: latest
+          # "latest"はGitHubの未認証API呼び出しでレート制限に達しやすいため、
+          # 具体的なバージョンに固定する（2026-07-18時点の最新版）。
+          version: 2.109.1
 
       - name: Ensure psql client is available
         run: |
