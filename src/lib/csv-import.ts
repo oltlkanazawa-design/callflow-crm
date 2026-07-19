@@ -1,4 +1,4 @@
-import type { Company, Heat } from "./types";
+import type { Company } from "./types";
 
 export type CanonicalField = "name" | "phone" | "website_url" | "location" | "industry" | "contact_name" | "email" | "memo" | "list_source";
 export type ColumnMapping = Record<number, CanonicalField | "">;
@@ -145,12 +145,24 @@ export function urlDomain(raw: string): string {
   return v;
 }
 
-export function normalizeName(raw: string): string {
-  return (raw || "").trim().replace(/\s+/g, "").toLowerCase();
+// 法人格の表記揺れ（株式会社／(株)／（株）／㈱ など）を同一形式へ正規化してから
+// 空白除去・小文字化する。法人格そのものを削除すると別の企業と誤って一致する
+// 範囲が広がるため、明確な表記差だけを吸収する（SQL側のnormalize_company_name
+// と同じ変換内容・同じ優先順位で実装すること）。
+function normalizeCorporateForm(raw: string): string {
+  return raw
+    .replace(/\(株\)/g, "株式会社")
+    .replace(/（株）/g, "株式会社")
+    .replace(/㈱/g, "株式会社")
+    .replace(/\(有\)/g, "有限会社")
+    .replace(/（有）/g, "有限会社")
+    .replace(/㈲/g, "有限会社")
+    .replace(/\(同\)/g, "合同会社")
+    .replace(/（同）/g, "合同会社");
 }
 
-function normalizeUrlValue(url: string): string {
-  return /^https?:\/\//i.test(url) ? url : `https://${url}`;
+export function normalizeName(raw: string): string {
+  return normalizeCorporateForm((raw || "").trim()).replace(/\s+/g, "").toLowerCase();
 }
 
 interface RegistryEntry { existing?: Company }
@@ -253,44 +265,6 @@ export function summarizeRows(headers: string[], mapping: ColumnMapping, rows: C
   const validCount = rows.length - missingRequiredCount;
   const duplicateCount = rows.filter(r => !r.errors.length && r.duplicate).length;
   return { total: rows.length, validCount, missingRequiredCount, duplicateCount, headers, mapping, previewRows: rows.slice(0, previewCount) };
-}
-
-export function rowToCompanyDraft(row: CsvRowResult, owner: string, defaultListSource: string): Company {
-  return {
-    id: crypto.randomUUID(),
-    name: row.name,
-    industry: row.industry,
-    location: row.location,
-    phone: toHalfWidthDigits(row.phone),
-    website_url: row.website_url ? normalizeUrlValue(row.website_url) : undefined,
-    email: row.email || undefined,
-    list_source: row.list_source || defaultListSource || "CSV一括登録",
-    contact_name: row.contact_name,
-    contact_department: "",
-    heat: "低" as Heat,
-    owner_name: owner,
-    memo: row.memo || "CSV一括登録で取り込み",
-  };
-}
-
-/** 重複更新用のpatchを組み立てる。CSV側が空欄の項目は既存企業の値を保持し、上書きしない */
-export function buildCompanyUpdatePatch(
-  row: CsvRowResult,
-  existing: Company,
-  defaultListSource: string,
-): Partial<Omit<Company, "id" | "owner_name">> {
-  const patch: Partial<Omit<Company, "id" | "owner_name">> = {};
-  if (row.name) patch.name = row.name;
-  if (row.phone) patch.phone = toHalfWidthDigits(row.phone);
-  if (row.website_url) patch.website_url = normalizeUrlValue(row.website_url);
-  if (row.location) patch.location = row.location;
-  if (row.industry) patch.industry = row.industry;
-  if (row.contact_name) patch.contact_name = row.contact_name;
-  if (row.email) patch.email = row.email;
-  if (row.memo) patch.memo = row.memo;
-  const listSource = row.list_source || defaultListSource;
-  if (listSource) patch.list_source = listSource;
-  return patch;
 }
 
 function escapeCsvField(v: string): string {

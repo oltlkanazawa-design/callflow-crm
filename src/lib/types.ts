@@ -22,6 +22,11 @@ export interface Company {
   last_called_at?: string;
   next_action_at?: string;
   created_at?: string;
+  // companies_with_call_status ビュー由来。デモモードでは常にfalse/undefined
+  call_prohibited?: boolean;
+  blocklist_id?: string | null;
+  blocked_scope?: string | null;
+  blocked_reason?: string | null;
 }
 
 export interface CallLog {

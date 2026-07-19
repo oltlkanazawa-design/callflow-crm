@@ -1,0 +1,255 @@
+name: Company Safety DB Tests
+
+# 企業安全管理（重複検出・架電禁止）PR1のSQL統合テスト。
+#
+# 【重要・安全上の制約】
+# - GitHubホステッドランナー（ubuntu-latest）上でのみ動作する。
+# - supabase CLIが起動するローカル環境（Dockerコンテナ）だけを対象とする。
+# - 本番Supabaseへは一切接続しない。次のコマンド・要素はこのワークフロー内で
+#   意図的に使用していない：
+#     supabase link / supabase db push / supabase migration up --linked /
+#     本番project refの参照 / SUPABASE_ACCESS_TOKEN / 本番DB URL / 本番用Secrets
+# - 実在する顧客データ・本番企業データは一切使用しない。テスト用の架空データのみ。
+# - ローカル環境の既定パスワード等はログに出さないようマスクする。
+#
+# mainへのpull_requestでも自動実行することで、マージ後の将来のPRでもRLS・RPC・
+# マイグレーション変更時にSQL検証が自動で走る、恒久的な回帰テストとして機能させる。
+
+on:
+  push:
+    branches:
+      - feature/company-safety
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "supabase/**"
+      - "src/lib/company-safety*"
+      - "src/lib/data.ts"
+      - ".github/workflows/company-safety-db-tests.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  db-tests:
+    name: Isolated Postgres SQL verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          # "latest"はGitHubの未認証API呼び出しでレート制限に達しやすいため、
+          # 具体的なバージョンに固定する（2026-07-18時点の最新版）。
+          version: 2.109.1
+
+      - name: Ensure psql client is available
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y postgresql-client
+          fi
+          psql --version
+
+      - name: Init scratch Supabase project (CI sandbox only, outside repo checkout)
+        env:
+          SANDBOX_DIR: ${{ runner.temp }}/supabase-ci-sandbox
+        run: |
+          set -euo pipefail
+          mkdir -p "$SANDBOX_DIR"
+          cd "$SANDBOX_DIR"
+          supabase init
+          # フルスタック（Studio/Storage/Realtime/Edge Functions等）は今回のSQLテストに
+          # 不要なため、Postgres本体と（auth.uid()等が依存する）認証周りのスキーマだけが
+          # 揃っていればよい。CLIバージョンによって軽量な個別起動フラグの名称が異なり
+          # 得るため、確実に動く「supabase start」（フルスタック）を使い、以後の各
+          # ステップではpsqlで直接SQLファイルを適用・実行することでREST/Studio等の
+          # サービス自体は使わない。
+          supabase start
+
+      - name: Extract local DB connection URL (local-only fixed dev credentials, no real secrets)
+        id: dbinfo
+        env:
+          SANDBOX_DIR: ${{ runner.temp }}/supabase-ci-sandbox
+        run: |
+          set -euo pipefail
+          cd "$SANDBOX_DIR"
+          DB_URL=$(supabase status -o env | grep '^DB_URL=' | cut -d'=' -f2- | tr -d '"')
+          if [ -z "$DB_URL" ]; then
+            echo "DB_URL could not be determined from 'supabase status'" >&2
+            exit 1
+          fi
+          echo "::add-mask::$DB_URL"
+          echo "db_url=$DB_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Reset DB (clean baseline for Scenario A)
+        env:
+          SANDBOX_DIR: ${{ runner.temp }}/supabase-ci-sandbox
+        run: |
+          set -euo pipefail
+          cd "$SANDBOX_DIR"
+          supabase db reset
+
+      - name: "Scenario A: apply schema.sql alone (new-project path)"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/fixtures/ci-privileges-setup.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/schema.sql
+
+      - name: "Scenario A: run multi-org regression + core logic tests"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-multi-org.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-core.sql
+
+      - name: Reset DB (clean baseline for Scenario B)
+        env:
+          SANDBOX_DIR: ${{ runner.temp }}/supabase-ci-sandbox
+        run: |
+          set -euo pipefail
+          cd "$SANDBOX_DIR"
+          supabase db reset
+
+      - name: "Scenario B: existing project + apply add-company-safety-stage-a.sql"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/fixtures/ci-privileges-setup.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/fixtures/base-schema-pre-company-safety.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/add-company-safety-stage-a.sql
+
+      - name: "Scenario B: run multi-org regression + core logic tests (via stage-A path)"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-multi-org.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-core.sql
+
+      - name: "Scenario B: rollback stage-A and verify objects are removed"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/rollback-company-safety-stage-a.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          do $$
+          begin
+            if to_regclass('public.call_blocklist') is not null then
+              raise exception 'FAIL: call_blocklist still exists after stage-A rollback';
+            end if;
+            if to_regclass('public.call_blocklist_audit') is not null then
+              raise exception 'FAIL: call_blocklist_audit still exists after stage-A rollback';
+            end if;
+            if to_regclass('public.companies_with_call_status') is not null then
+              raise exception 'FAIL: companies_with_call_status view still exists after stage-A rollback';
+            end if;
+            if to_regprocedure('public.create_company_checked(text,text,text,text,text,text,text,text,text,text)') is not null then
+              raise exception 'FAIL: create_company_checked still exists after stage-A rollback';
+            end if;
+            raise notice 'PASS: stage-A rollback removed all new objects';
+          end $$;
+          -- 緊急ロールバックによってsearch_path=''等のセキュリティ強化が失われていないことを、
+          -- pg_procのproconfigから直接確認する（関数定義のテキストではなく実際のカタログ状態）。
+          do $$
+          declare
+            v_cfg text[];
+            v_ok boolean;
+          begin
+            -- proconfigの要素は search_path='' の場合 'search_path=""'（値を二重引用符で
+            -- 囲んだ形）で格納されるため、'='より後ろを引用符ごとtrimして空かどうかで判定する
+            select proconfig into v_cfg from pg_proc where proname='record_call' and pronamespace='public'::regnamespace;
+            v_ok := v_cfg is not null and exists (
+              select 1 from unnest(v_cfg) e
+              where split_part(e, '=', 1) = 'search_path' and btrim(substring(e from position('=' in e) + 1), '"') = ''
+            );
+            if not v_ok then
+              raise exception 'FAIL: stage-Aロールバック後、record_call()のsearch_pathがハードニングされていません（proconfig: %）', v_cfg;
+            end if;
+            select proconfig into v_cfg from pg_proc where proname='current_organization_id' and pronamespace='public'::regnamespace;
+            v_ok := v_cfg is not null and exists (
+              select 1 from unnest(v_cfg) e
+              where split_part(e, '=', 1) = 'search_path' and btrim(substring(e from position('=' in e) + 1), '"') = ''
+            );
+            if not v_ok then
+              raise exception 'FAIL: stage-Aロールバック後、current_organization_id()のsearch_pathがハードニングされていません（proconfig: %）', v_cfg;
+            end if;
+            raise notice 'PASS: stage-Aロールバック後もrecord_call()/current_organization_id()のsearch_path=''''ハードニングが維持されている';
+          end $$;
+          do $$
+          begin
+            if has_function_privilege('public', 'public.current_organization_id()', 'execute') then
+              raise exception 'FAIL: stage-Aロールバック後もpublicロールがcurrent_organization_id()を実行できてしまいます';
+            end if;
+            raise notice 'PASS: stage-Aロールバック後もcurrent_organization_id()へのpublic実行権限は復元されていない';
+          end $$;
+          SQL
+
+      - name: "Scenario B: re-apply stage-A after rollback and re-run tests"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/add-company-safety-stage-a.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-multi-org.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-core.sql
+
+      - name: "Reset DB (clean baseline for Scenario C: stage-B lifecycle)"
+        env:
+          SANDBOX_DIR: ${{ runner.temp }}/supabase-ci-sandbox
+        run: |
+          set -euo pipefail
+          cd "$SANDBOX_DIR"
+          supabase db reset
+
+      - name: "Scenario C: apply schema.sql, then run stage-B apply/rollback/reapply test"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/fixtures/ci-privileges-setup.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/schema.sql
+          # company-safety-stage-b.sql自体が、内部で harden-company-writes-stage-b.sql の
+          # 適用 → テスト → rollback-harden-company-writes-stage-b.sql による復元 → 再適用
+          # までを一貫して行う（\i でリポジトリ内の相対パスを読み込むため、
+          # 実行時のカレントディレクトリをリポジトリルートに保つ）
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-stage-b.sql
+
+      - name: "Reset DB (clean baseline for Scenario D: concurrency)"
+        env:
+          SANDBOX_DIR: ${{ runner.temp }}/supabase-ci-sandbox
+        run: |
+          set -euo pipefail
+          cd "$SANDBOX_DIR"
+          supabase db reset
+
+      - name: "Scenario D: apply schema.sql, then run concurrency tests"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/fixtures/ci-privileges-setup.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/schema.sql
+          # 同時実行テストは、2本のpsqlプロセスをシェルレベルで並列起動して行う
+          # （dblink拡張は、supabase CLIローカルスタックのロール権限・認証方式の
+          # 差異により安定して使えなかったため採用しなかった）
+          chmod +x supabase/tests/company-safety-concurrency.sh
+          supabase/tests/company-safety-concurrency.sh "$DB_URL"
+
+      - name: Stop Supabase sandbox
+        if: always()
+        env:
+          SANDBOX_DIR: ${{ runner.temp }}/supabase-ci-sandbox
+        run: |
+          cd "$SANDBOX_DIR"
+          supabase stop --no-backup || true

@@ -1,15 +1,18 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Building2, ChevronRight, ExternalLink, History, LayoutDashboard, LogOut, Menu, Phone, Plus, Search, Sparkles, Upload, Users, X } from "lucide-react";
-import { loadCRMData, saveCallLog, saveCompaniesBulk, saveCompany, updateCompany, inviteMember, cancelInvitation, setMemberActive, setMemberRole } from "@/lib/data";
+import { Building2, ChevronRight, ExternalLink, History, LayoutDashboard, LogOut, Menu, Phone, Plus, Search, ShieldAlert, Sparkles, Upload, Users, X } from "lucide-react";
+import { loadCRMData, saveCallLog, createCompanyChecked, createCompaniesChecked, blockCompanyCalls, unblockCompanyCalls, inviteMember, cancelInvitation, setMemberActive, setMemberRole } from "@/lib/data";
+import type { BulkRowInput } from "@/lib/data";
 import { isSupabaseConfigured, createClient } from "@/lib/supabase/client";
 import type { CallLog, CallResult, Company, Heat, Member, MemberInvitation, MemberRole, TranscriptAnalysis } from "@/lib/types";
 import {
-  autoDetectMapping, buildCompanyUpdatePatch, buildErrorReportCsv, buildRows, decodeCsvFile, detectDelimiter, parseCsvText,
-  rowToCompanyDraft, summarizeRows, CANONICAL_FIELD_LABELS, CANONICAL_FIELD_ORDER, DUPLICATE_TIER_LABELS,
+  autoDetectMapping, buildErrorReportCsv, buildRows, decodeCsvFile, detectDelimiter, parseCsvText,
+  summarizeRows, CANONICAL_FIELD_LABELS, CANONICAL_FIELD_ORDER, DUPLICATE_TIER_LABELS,
 } from "@/lib/csv-import";
 import type { CanonicalField, ColumnMapping, CsvRowResult, DuplicateMode } from "@/lib/csv-import";
+import { companySafetyErrorMessage, matchScopeLabel, MATCH_SCOPES, MATCH_SCOPE_OPTION_LABELS } from "@/lib/company-safety";
+import type { MatchScope } from "@/lib/company-safety";
 import {
   filterCompaniesByMember, filterLogsByMember, activeMemberOptions, buildMemberListRows, readStoredViewFilter, writeStoredViewFilter,
   resolveViewFilterMemberId, resolveCallIndex, computeTeamKpis,
@@ -48,6 +51,7 @@ export default function CallFlowApp() {
   const [importModal,setImportModal] = useState(false);
   const [csvModal,setCsvModal] = useState(false);
   const [aiModal,setAiModal] = useState(false);
+  const [blockModal,setBlockModal] = useState<Company|null>(null);
   const [toast,setToast] = useState("");
 
   useEffect(()=>{writeStoredViewFilter(viewFilterMemberId)},[viewFilterMemberId]);
@@ -59,6 +63,8 @@ export default function CallFlowApp() {
   const go=(next:View)=>{setView(next);setMenu(false)};
   const filteredCompanies=useMemo(()=>filterCompaniesByMember(companies,viewFilterMemberId),[companies,viewFilterMemberId]);
   const filteredLogs=useMemo(()=>filterLogsByMember(logs,viewFilterMemberId),[logs,viewFilterMemberId]);
+  // 架電禁止に設定された企業は、架電画面の対象からは除外する（一覧・管理には引き続き表示する）
+  const callableCompanies=useMemo(()=>filteredCompanies.filter(c=>!c.call_prohibited),[filteredCompanies]);
 
   // 保存済みの担当者フィルターが、メンバー一覧の取得後に無効（存在しない／利用停止済み）と
   // 判明した場合は"all"へ戻す（Reactの「レンダー中に状態を調整する」パターン。
@@ -73,10 +79,10 @@ export default function CallFlowApp() {
   const [prevViewFilterMemberId,setPrevViewFilterMemberId]=useState(viewFilterMemberId);
   const filterChanged=viewFilterMemberId!==prevViewFilterMemberId;
   if(filterChanged)setPrevViewFilterMemberId(viewFilterMemberId);
-  const resolvedCallIndex=resolveCallIndex({filterChanged,callIndex,filteredCompaniesLength:filteredCompanies.length});
+  const resolvedCallIndex=resolveCallIndex({filterChanged,callIndex,filteredCompaniesLength:callableCompanies.length});
   if(resolvedCallIndex!==callIndex)setCallIndex(resolvedCallIndex);
 
-  const callCompany=(company:Company)=>{setCallIndex(Math.max(0,filteredCompanies.findIndex(c=>c.id===company.id)));go("call")};
+  const callCompany=(company:Company)=>{if(company.call_prohibited)return;setCallIndex(Math.max(0,callableCompanies.findIndex(c=>c.id===company.id)));go("call")};
   const logout=async()=>{if(isSupabaseConfigured)await createClient().auth.signOut();location.href="/login"};
 
   return <div className="min-h-screen bg-[#f5f7fb] text-[#172036]">
@@ -92,16 +98,17 @@ export default function CallFlowApp() {
       <header className="flex min-h-[76px] items-center justify-between gap-3 px-4 md:px-8"><div className="flex items-center gap-3"><button className="lg:hidden" onClick={()=>setMenu(true)}><Menu/></button><div><h1 className="text-xl font-extrabold tracking-tight md:text-2xl">{meta[view][0]}</h1><p className="mt-1 hidden text-xs text-slate-500 sm:block">{meta[view][1]}</p></div></div><div className="flex gap-2"><select className="input hidden !w-auto md:block" value={viewFilterMemberId} onChange={e=>setViewFilterMemberId(e.target.value)} aria-label="担当者で絞り込み"><option value="all">全員</option>{activeMemberOptions(allMembers).map(m=><option key={m.id} value={m.id}>{m.full_name}</option>)}</select><button className="btn btn-ai" onClick={()=>setAiModal(true)}><Sparkles size={15}/><span className="hidden sm:inline">文字起こし解析</span></button></div></header>
       <div className="px-4 pb-10 md:px-8">{loading?<Loading/>:<>
         {view==="dashboard"&&<Dashboard companies={filteredCompanies} logs={filteredLogs} go={go}/>}
-        {view==="companies"&&<Companies companies={filteredCompanies} callCompany={callCompany} add={()=>setCompanyModal(true)} bulkImport={()=>setImportModal(true)} csvImport={()=>setCsvModal(true)}/>}
-        {view==="call"&&<CallScreen company={filteredCompanies[callIndex]} member={currentUserName} next={()=>setCallIndex(i=>filteredCompanies.length?(i+1)%filteredCompanies.length:0)} onSaved={refresh} notify={notify}/>}
+        {view==="companies"&&<Companies companies={filteredCompanies} callCompany={callCompany} add={()=>setCompanyModal(true)} bulkImport={()=>setImportModal(true)} csvImport={()=>setCsvModal(true)} isAdmin={isAdmin} toggleBlock={c=>setBlockModal(c)}/>}
+        {view==="call"&&<CallScreen company={callableCompanies[callIndex]} hasBlockedRemaining={callableCompanies.length===0&&filteredCompanies.length>0} member={currentUserName} next={()=>setCallIndex(i=>callableCompanies.length?(i+1)%callableCompanies.length:0)} onSaved={refresh} notify={notify}/>}
         {view==="history"&&<HistoryView logs={filteredLogs}/>}
         {view==="team"&&<Team logs={filteredLogs} allMembers={allMembers} pendingInvitations={pendingInvitations} viewFilterMemberId={viewFilterMemberId} currentUserId={currentUserId} isAdmin={isAdmin} notify={notify} refresh={refresh}/>}
       </>}</div>
     </main>
-    {companyModal&&<CompanyModal member={currentUserName} close={()=>setCompanyModal(false)} saved={async c=>{setCompanies(x=>[c,...x]);setCompanyModal(false);notify("企業を登録しました")}}/>}
-    {importModal&&<LeadImportModal member={currentUserName} existing={companies} close={()=>setImportModal(false)} saved={async added=>{await refresh();setImportModal(false);notify(`${added}件の営業先を取り込みました`)}}/>}
-    {csvModal&&<CsvImportModal member={currentUserName} existing={companies} close={()=>setCsvModal(false)} saved={async summary=>{await refresh();setCsvModal(false);notify(`新規${summary.newCount}件・更新${summary.updatedCount}件を登録しました（スキップ${summary.skippedCount}件・エラー${summary.errorCount}件）`)}}/>}
-    {aiModal&&<TranscriptModal company={filteredCompanies[callIndex]} close={()=>setAiModal(false)} onApply={(a,transcript)=>{sessionStorage.setItem("callflow_analysis",JSON.stringify({...a,transcript}));setAiModal(false);go("call");notify("解析結果を架電記録へ反映しました")}}/>}
+    {companyModal&&<CompanyModal member={currentUserName} close={()=>setCompanyModal(false)} saved={async()=>{await refresh();setCompanyModal(false)}} notify={notify}/>}
+    {importModal&&<LeadImportModal member={currentUserName} existing={companies} close={()=>setImportModal(false)} saved={async s=>{await refresh();setImportModal(false);notify(`${s.inserted}件の営業先を取り込みました${s.skipped||s.blocked?`（重複${s.skipped}件・架電禁止${s.blocked}件はスキップ）`:""}`)}} notify={notify}/>}
+    {csvModal&&<CsvImportModal member={currentUserName} existing={companies} close={()=>setCsvModal(false)} saved={async summary=>{await refresh();setCsvModal(false);notify(`新規${summary.newCount}件・更新${summary.updatedCount}件を登録しました（スキップ${summary.skippedCount}件・架電禁止${summary.blockedCount}件・エラー${summary.errorCount}件）`)}} notify={notify}/>}
+    {aiModal&&<TranscriptModal company={callableCompanies[callIndex]} close={()=>setAiModal(false)} onApply={(a,transcript)=>{sessionStorage.setItem("callflow_analysis",JSON.stringify({...a,transcript}));setAiModal(false);go("call");notify("解析結果を架電記録へ反映しました")}}/>}
+    {blockModal&&<BlockModal company={blockModal} close={()=>setBlockModal(null)} done={async()=>{await refresh();setBlockModal(null)}} notify={notify}/>}
     {toast&&<div className="fixed bottom-6 right-6 z-[70] rounded-xl bg-[#152039] px-5 py-3 text-sm font-semibold text-white shadow-2xl">{toast}</div>}
     {!isSupabaseConfigured&&<div className="fixed bottom-3 left-3 z-20 rounded-full bg-amber-100 px-3 py-1 text-[10px] font-bold text-amber-800 lg:left-[250px]">デモモード</div>}
   </div>;
@@ -118,10 +125,10 @@ function Dashboard({companies,logs,go}:{companies:Company[];logs:CallLog[];go:(v
 function ActivityChart({logs}:{logs:CallLog[]}){const formatter=new Intl.DateTimeFormat("sv-SE",{timeZone:"Asia/Tokyo"});const data=Array.from({length:7},(_,i)=>{const date=new Date();date.setDate(date.getDate()-(6-i));const key=formatter.format(date),items=logs.filter(l=>formatter.format(new Date(l.created_at))===key);return [new Intl.DateTimeFormat("ja-JP",{weekday:"short",timeZone:"Asia/Tokyo"}).format(date),items.length,items.filter(l=>l.result!=="担当者不在").length] as const});const max=Math.max(1,...data.map(x=>x[1]));return <><div className="flex h-[215px] items-end gap-2 border-b border-slate-200 bg-[repeating-linear-gradient(to_top,#fff_0,#fff_42px,#f1f4f8_43px)] px-2">{data.map(([d,a,b],i)=><div className="relative flex h-full flex-1 items-end gap-1" key={`${d}-${i}`}><i className="flex-1 rounded-t bg-blue-600" style={{height:`${Math.max(a?5:0,a/max*185)}px`}}/><i className="flex-1 rounded-t bg-blue-200" style={{height:`${Math.max(b?5:0,b/max*185)}px`}}/><label className="absolute -bottom-6 w-full text-center text-[10px] text-slate-500">{d}</label></div>)}</div><p className="mt-8 text-[10px] text-slate-500"><i className="mr-1 inline-block size-2 rounded-full bg-blue-600"/>架電数 <i className="ml-3 mr-1 inline-block size-2 rounded-full bg-blue-200"/>接続数</p></>}
 function CardHead({title,sub,click}:{title:string;sub?:string;click?:()=>void}){return <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><h2 className="text-sm font-extrabold">{title}</h2>{sub&&<button onClick={click} className={`text-[11px] ${click?"font-bold text-blue-600":"text-slate-500"}`}>{sub}</button>}</div>}
 
-function Companies({companies,callCompany,add,bulkImport,csvImport}:{companies:Company[];callCompany:(c:Company)=>void;add:()=>void;bulkImport:()=>void;csvImport:()=>void}) { const [q,setQ]=useState("");const [heat,setHeat]=useState("");const [more,setMore]=useState(false);const filtered=companies.filter(c=>(c.name+c.contact_name+c.phone+(c.website_url||"")).toLowerCase().includes(q.toLowerCase())&&(!heat||c.heat===heat));return <div className="fade-in"><div className="mb-3 flex flex-wrap items-center gap-2"><div className="relative min-w-[240px] flex-1 md:max-w-sm"><Search className="absolute left-3 top-2.5 size-4 text-slate-400"/><input className="input pl-9" placeholder="企業名・担当者名・電話・URLで検索" value={q} onChange={e=>setQ(e.target.value)}/></div><select className="input !w-auto" value={heat} onChange={e=>setHeat(e.target.value)}><option value="">すべての温度感</option><option>高</option><option>中</option><option>低</option></select><button className="btn btn-primary" onClick={csvImport}><Upload size={15}/>CSV一括登録</button><div className="relative">{more&&<button className="fixed inset-0 z-10 cursor-default" onClick={()=>setMore(false)} aria-label="メニューを閉じる"/>}<button className="btn btn-light" onClick={()=>setMore(o=>!o)}>その他の登録方法 ▾</button>{more&&<div className="absolute right-0 top-full z-20 mt-1 w-60 rounded-xl border border-slate-100 bg-white p-1.5 shadow-lg"><button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-slate-50" onClick={()=>{setMore(false);add()}}><Plus size={14}/>企業を追加（手動）</button><button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-slate-50" onClick={()=>{setMore(false);bulkImport()}}><Upload size={14}/>リスト自動取り込み（貼り付け）</button></div>}</div></div><div className="card overflow-x-auto"><table className="w-full min-w-[1040px] border-collapse"><thead><tr className="bg-slate-50 text-left text-[10px] text-slate-500">{["企業名","URL","業種","担当者","温度感","最終架電","次回対応","担当",""].map(x=><th className="border-b border-slate-200 px-4 py-3" key={x}>{x}</th>)}</tr></thead><tbody>{filtered.map(c=><tr key={c.id} className="text-xs hover:bg-slate-50"><td className="border-b border-slate-100 p-4"><b>{c.name}</b><small className="mt-1 block text-[10px] text-slate-500">{c.location} ／ {c.phone}</small></td><td className="border-b border-slate-100 p-4">{c.website_url?<a className="inline-flex items-center gap-1 font-bold text-blue-600" href={c.website_url} target="_blank" rel="noreferrer">確認<ExternalLink size={12}/></a>:<a className="text-slate-400 underline" href={searchUrl(c.name)} target="_blank" rel="noreferrer">検索</a>}</td><td className="border-b border-slate-100 p-4">{c.industry}</td><td className="border-b border-slate-100 p-4">{c.contact_department} {c.contact_name}</td><td className="border-b border-slate-100 p-4"><HeatBadge heat={c.heat}/></td><td className="border-b border-slate-100 p-4">{fmt(c.last_called_at)}</td><td className="border-b border-slate-100 p-4">{fmt(c.next_action_at,true)}</td><td className="border-b border-slate-100 p-4">{c.owner_name}</td><td className="border-b border-slate-100 p-4"><button className="font-bold text-blue-600" onClick={()=>callCompany(c)}>架電する</button></td></tr>)}</tbody></table>{!filtered.length&&<p className="p-16 text-center text-sm text-slate-500">該当する企業がありません</p>}</div></div> }
+function Companies({companies,callCompany,add,bulkImport,csvImport,isAdmin,toggleBlock}:{companies:Company[];callCompany:(c:Company)=>void;add:()=>void;bulkImport:()=>void;csvImport:()=>void;isAdmin:boolean;toggleBlock:(c:Company)=>void}) { const [q,setQ]=useState("");const [heat,setHeat]=useState("");const [more,setMore]=useState(false);const filtered=companies.filter(c=>(c.name+c.contact_name+c.phone+(c.website_url||"")).toLowerCase().includes(q.toLowerCase())&&(!heat||c.heat===heat));return <div className="fade-in"><div className="mb-3 flex flex-wrap items-center gap-2"><div className="relative min-w-[240px] flex-1 md:max-w-sm"><Search className="absolute left-3 top-2.5 size-4 text-slate-400"/><input className="input pl-9" placeholder="企業名・担当者名・電話・URLで検索" value={q} onChange={e=>setQ(e.target.value)}/></div><select className="input !w-auto" value={heat} onChange={e=>setHeat(e.target.value)}><option value="">すべての温度感</option><option>高</option><option>中</option><option>低</option></select><button className="btn btn-primary" onClick={csvImport}><Upload size={15}/>CSV一括登録</button><div className="relative">{more&&<button className="fixed inset-0 z-10 cursor-default" onClick={()=>setMore(false)} aria-label="メニューを閉じる"/>}<button className="btn btn-light" onClick={()=>setMore(o=>!o)}>その他の登録方法 ▾</button>{more&&<div className="absolute right-0 top-full z-20 mt-1 w-60 rounded-xl border border-slate-100 bg-white p-1.5 shadow-lg"><button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-slate-50" onClick={()=>{setMore(false);add()}}><Plus size={14}/>企業を追加（手動）</button><button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-xs hover:bg-slate-50" onClick={()=>{setMore(false);bulkImport()}}><Upload size={14}/>リスト自動取り込み（貼り付け）</button></div>}</div></div><div className="card overflow-x-auto"><table className="w-full min-w-[1120px] border-collapse"><thead><tr className="bg-slate-50 text-left text-[10px] text-slate-500">{["企業名","URL","業種","担当者","温度感","最終架電","次回対応","担当","",""].map((x,i)=><th className="border-b border-slate-200 px-4 py-3" key={i}>{x}</th>)}</tr></thead><tbody>{filtered.map(c=><tr key={c.id} className={`text-xs hover:bg-slate-50 ${c.call_prohibited?"bg-red-50/40":""}`}><td className="border-b border-slate-100 p-4"><b>{c.name}</b>{c.call_prohibited&&<span className="badge ml-2 bg-red-100 text-red-700"><ShieldAlert size={11} className="mr-0.5 inline"/>架電禁止</span>}<small className="mt-1 block text-[10px] text-slate-500">{c.location} ／ {c.phone}</small>{c.call_prohibited&&<small className="mt-0.5 block text-[10px] font-bold text-red-600">一致条件：{matchScopeLabel(c.blocked_scope||"")}／理由：{c.blocked_reason||"（理由未設定）"}</small>}</td><td className="border-b border-slate-100 p-4">{c.website_url?<a className="inline-flex items-center gap-1 font-bold text-blue-600" href={c.website_url} target="_blank" rel="noreferrer">確認<ExternalLink size={12}/></a>:<a className="text-slate-400 underline" href={searchUrl(c.name)} target="_blank" rel="noreferrer">検索</a>}</td><td className="border-b border-slate-100 p-4">{c.industry}</td><td className="border-b border-slate-100 p-4">{c.contact_department} {c.contact_name}</td><td className="border-b border-slate-100 p-4"><HeatBadge heat={c.heat}/></td><td className="border-b border-slate-100 p-4">{fmt(c.last_called_at)}</td><td className="border-b border-slate-100 p-4">{fmt(c.next_action_at,true)}</td><td className="border-b border-slate-100 p-4">{c.owner_name}</td><td className="border-b border-slate-100 p-4">{c.call_prohibited?<span className="text-slate-400">架電禁止中</span>:<button className="font-bold text-blue-600" onClick={()=>callCompany(c)}>架電する</button>}</td><td className="border-b border-slate-100 p-4">{isAdmin&&<button className={`text-[11px] font-bold ${c.call_prohibited?"text-emerald-600":"text-red-600"}`} onClick={()=>toggleBlock(c)}>{c.call_prohibited?"解除":"禁止"}</button>}</td></tr>)}</tbody></table>{!filtered.length&&<p className="p-16 text-center text-sm text-slate-500">該当する企業がありません</p>}</div></div> }
 function HeatBadge({heat}:{heat:Heat}) {return <span className={`badge ${heat==="高"?"bg-red-50 text-red-600":heat==="中"?"bg-amber-50 text-amber-700":"bg-slate-100 text-slate-600"}`}>● {heat}</span>}
 
-function CallScreen({company,member,next,onSaved,notify}:{company?:Company;member:string;next:()=>void;onSaved:()=>Promise<void>;notify:(s:string)=>void}) { const [staged]=useState<(TranscriptAnalysis&{transcript?:string})|null>(()=>{if(typeof window==="undefined")return null;const raw=sessionStorage.getItem("callflow_analysis");if(!raw)return null;sessionStorage.removeItem("callflow_analysis");try{return JSON.parse(raw) as TranscriptAnalysis&{transcript?:string}}catch{return null}});const [result,setResult]=useState<CallResult|"">(staged?.result||"");const [note,setNote]=useState(staged?`${staged.summary}\n次回対応：${staged.next_action}`:"");const [nextAt,setNextAt]=useState(staged?.next_action_at||"");const [saving,setSaving]=useState(false);if(!company)return <div className="card p-16 text-center text-slate-500">架電対象の企業がありません</div>;
+function CallScreen({company,hasBlockedRemaining,member,next,onSaved,notify}:{company?:Company;hasBlockedRemaining?:boolean;member:string;next:()=>void;onSaved:()=>Promise<void>;notify:(s:string)=>void}) { const [staged]=useState<(TranscriptAnalysis&{transcript?:string})|null>(()=>{if(typeof window==="undefined")return null;const raw=sessionStorage.getItem("callflow_analysis");if(!raw)return null;sessionStorage.removeItem("callflow_analysis");try{return JSON.parse(raw) as TranscriptAnalysis&{transcript?:string}}catch{return null}});const [result,setResult]=useState<CallResult|"">(staged?.result||"");const [note,setNote]=useState(staged?`${staged.summary}\n次回対応：${staged.next_action}`:"");const [nextAt,setNextAt]=useState(staged?.next_action_at||"");const [saving,setSaving]=useState(false);if(!company)return <div className="card p-16 text-center text-slate-500">{hasBlockedRemaining?"表示中の企業はすべて架電禁止に設定されています":"架電対象の企業がありません"}</div>;
  const save=async()=>{if(!result)return notify("架電結果を選択してください");setSaving(true);const created=new Date().toISOString(),updated={...company,heat:result==="アポ獲得"?"高" as Heat:company.heat,memo:note||company.memo,last_called_at:created,next_action_at:nextAt||undefined};const log:CallLog={id:crypto.randomUUID(),company_id:company.id,company_name:company.name,caller_name:member,result,note:note||"メモなし",transcript:staged?.transcript,ai_summary:staged?.summary,created_at:created,next_action_at:nextAt||undefined};try{await saveCallLog(log,updated);await onSaved();notify("架電記録を保存しました");setResult("");setNote("");setNextAt("");next()}catch(e){notify(e instanceof Error?e.message:"保存に失敗しました")}finally{setSaving(false)}};
  return <div className="grid gap-4 xl:grid-cols-[1.15fr_.85fr]"><div className="card p-5"><div className="flex items-start justify-between gap-3"><div><HeatBadge heat={company.heat}/><h2 className="mt-2 text-2xl font-extrabold">{company.name}</h2><p className="mt-1 text-xs text-slate-500">{company.industry} ／ {company.location}</p><a href={`tel:${company.phone}`} className="mt-4 block text-xl font-extrabold text-blue-600">{company.phone}</a><div className="mt-3 flex flex-wrap gap-2">{company.website_url&&<a className="btn btn-light !py-2 text-xs" href={company.website_url} target="_blank" rel="noreferrer"><ExternalLink size={14}/>公式URLを開く</a>}<a className="btn btn-light !py-2 text-xs" href={searchUrl(company.name)} target="_blank" rel="noreferrer"><Search size={14}/>会社名で検索</a>{company.source_url&&<a className="btn btn-light !py-2 text-xs" href={company.source_url} target="_blank" rel="noreferrer">取得元</a>}</div></div><button className="btn btn-light" onClick={next}>次の企業 <ChevronRight size={15}/></button></div><div className="my-5 grid grid-cols-2 gap-2"><Info l="担当者" v={`${company.contact_department||""} ${company.contact_name}`}/><Info l="過去の接触" v={company.last_called_at?`最終 ${fmt(company.last_called_at,true)}`:"接触履歴なし"}/><Info l="前回の内容" v={company.memo||"記録なし"}/><Info l="次回対応" v={fmt(company.next_action_at,true)}/></div><PreCallChecklist company={company}/><div className="mt-4 rounded-r-lg border-l-[3px] border-blue-600 bg-slate-50 p-4 text-xs leading-7"><b>受付：</b>お世話になります。OLTLの辻と申します。<br/><em className="font-bold not-italic text-blue-600">県内大学生との接点づくりに関する採用広報のご提案</em>で、新卒採用のご担当者様をお願いできますか？<br/><br/><b>担当者：</b>県内学生に御社を知ってもらうためのSNS採用広報について、事例を交えて15分ほどご紹介しています。</div></div><div className="card"><CardHead title="架電結果を記録" sub={`担当：${member}`}/><div className="p-5"><div className="mb-4 rounded-xl border border-violet-200 bg-gradient-to-br from-violet-50 to-blue-50 p-3"><b className="block text-xs text-violet-700">✦ appserver解析で自動入力できます</b><span className="text-[10px] text-slate-500">右上の「文字起こし解析」を利用してください。外部AI APIなしでもルール解析で動作します。</span></div><Label text="架電結果"><div className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-2 2xl:grid-cols-3">{results.map(r=><button key={r.value} onClick={()=>setResult(r.value)} className={`rounded-lg border p-2.5 text-[11px] ${result===r.value?"border-blue-500 bg-blue-50 font-bold text-blue-600":"border-slate-200 hover:border-blue-300"}`}>{r.label}</button>)}</div></Label><Label text="会話メモ"><textarea className="input min-h-24 resize-y" value={note} onChange={e=>setNote(e.target.value)} placeholder="相手の反応、課題、伝えた内容など"/></Label><Label text="次回対応日"><input type="datetime-local" className="input" value={nextAt} onChange={e=>setNextAt(e.target.value)}/></Label><div className="mt-4 flex gap-2"><button className="btn btn-light flex-1" onClick={next}>スキップ</button><button disabled={saving} className="btn btn-primary flex-1 disabled:opacity-50" onClick={save}>{saving?"保存中…":"記録して次へ"}</button></div></div></div></div> }
 function Info({l,v}:{l:string;v:string}){return <div className="rounded-lg bg-slate-50 p-3"><small className="block text-[9px] text-slate-500">{l}</small><b className="mt-1 block text-xs">{v}</b></div>}
@@ -196,11 +203,48 @@ function InviteMemberModal({close,saved,notify}:{close:()=>void;saved:()=>void;n
 function Kpi({l,v}:{l:string;v:string|number}){return <div className="card p-4"><small className="font-bold text-slate-500">{l}</small><p className="mt-2 text-3xl font-extrabold">{v}</p></div>}
 
 function Modal({title,sub,close,children}:{title:string;sub?:string;close:()=>void;children:React.ReactNode}) {return <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/50 p-3" onMouseDown={e=>{if(e.target===e.currentTarget)close()}}><div className="max-h-[94vh] w-full max-w-[680px] overflow-auto rounded-2xl bg-white shadow-2xl"><div className="flex items-start justify-between border-b border-slate-100 p-5"><div><h2 className="font-extrabold">{title}</h2>{sub&&<p className="mt-1 text-[10px] text-slate-500">{sub}</p>}</div><button onClick={close}><X className="size-5 text-slate-400"/></button></div><div className="p-5">{children}</div></div></div>}
-function LeadImportModal({member,existing,close,saved}:{member:string;existing:Company[];close:()=>void;saved:(added:number)=>void}) {const [raw,setRaw]=useState("株式会社サンプル商事,076-000-0000,https://example.com\n石川採用テック 076-111-2222 www.example.jp");const [defaults,setDefaults]=useState({industry:"",location:"石川県",source:""});const [busy,setBusy]=useState(false);const leads=useMemo(()=>parseLeadRows(raw,member,existing,defaults),[raw,member,existing,defaults]);const submit=async()=>{if(!leads.length)return;setBusy(true);try{for(const lead of leads)await saveCompany(lead);saved(leads.length)}finally{setBusy(false)}};return <Modal title="営業先リストを自動取り込み" sub="CSV・表・Webページからコピーしたテキストを貼ると、会社名・電話番号・URLを抽出します" close={close}><div className="grid gap-3 sm:grid-cols-3"><Field l="既定の業種" v={defaults.industry} set={v=>setDefaults(d=>({...d,industry:v}))}/><Field l="既定の所在地" v={defaults.location} set={v=>setDefaults(d=>({...d,location:v}))}/><Field l="取得元URL" v={defaults.source} set={v=>setDefaults(d=>({...d,source:v}))}/></div><Label text="リスト貼り付け"><textarea className="input min-h-[180px] resize-y font-mono text-xs" value={raw} onChange={e=>setRaw(e.target.value)} placeholder="会社名, 電話番号, URL の順でなくてもOKです"/></Label><div className="mb-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-600"><b className="block text-slate-800">取り込み候補：{leads.length}件</b><p className="mt-1 text-[10px]">既存の企業名＋電話番号と重複する行、会社名か電話番号が取れない行は除外します。</p></div>{leads.length>0&&<div className="mb-4 max-h-44 overflow-auto rounded-xl border border-slate-100"><table className="w-full text-left text-[11px]"><thead className="bg-slate-50 text-slate-500"><tr><th className="p-2">企業名</th><th className="p-2">電話</th><th className="p-2">URL</th></tr></thead><tbody>{leads.slice(0,20).map(l=><tr key={l.id}><td className="border-t border-slate-100 p-2 font-bold">{l.name}</td><td className="border-t border-slate-100 p-2">{l.phone}</td><td className="border-t border-slate-100 p-2">{l.website_url||"未検出"}</td></tr>)}</tbody></table></div>}<button disabled={busy||!leads.length} onClick={submit} className="btn btn-primary w-full disabled:opacity-50">{busy?"取り込み中…":`${leads.length}件を登録する`}</button></Modal>}
+
+function BlockModal({company,close,done,notify}:{company:Company;close:()=>void;done:()=>Promise<void>;notify:(s:string)=>void}) {
+ const [reason,setReason]=useState("");
+ const [scope,setScope]=useState<MatchScope>("phone");
+ const [busy,setBusy]=useState(false);
+ const isUnblock=Boolean(company.call_prohibited);
+ const submit=async()=>{
+  if(!reason.trim())return;
+  setBusy(true);
+  try{
+   if(isUnblock){
+    if(!company.blocklist_id)throw new Error("架電禁止設定が見つかりません");
+    await unblockCompanyCalls(company.blocklist_id,reason);
+   }else{
+    await blockCompanyCalls(company.id,reason,scope);
+   }
+   await done();
+   notify(isUnblock?"架電禁止を解除しました":"架電禁止に設定しました");
+  }catch(e){notify(e instanceof Error?e.message:"処理に失敗しました")}
+  finally{setBusy(false)}
+ };
+ return <Modal title={isUnblock?"架電禁止を解除":"架電禁止に設定"} sub={company.name} close={close}>
+  {isUnblock&&company.blocked_reason&&<p className="mb-3 rounded-lg bg-red-50 p-3 text-xs text-red-700">現在の一致条件：{matchScopeLabel(company.blocked_scope||"")}／禁止理由：{company.blocked_reason}</p>}
+  {!isUnblock&&<Label text="一致条件 *"><div className="grid gap-2">{MATCH_SCOPES.map(s=><label key={s} className={`flex cursor-pointer items-start gap-2 rounded-lg border p-2.5 text-[11px] ${scope===s?"border-blue-500 bg-blue-50":"border-slate-200"}`}><input type="radio" name="match_scope" className="mt-0.5" checked={scope===s} onChange={()=>setScope(s)}/><span>{MATCH_SCOPE_OPTION_LABELS[s]}</span></label>)}</div></Label>}
+  <Label text="理由 *"><textarea className="input min-h-20" value={reason} onChange={e=>setReason(e.target.value)} placeholder="例：クレーム対応中のため／誤登録の解消のため"/></Label>
+  <button disabled={busy||!reason.trim()} onClick={submit} className={`btn mt-3 w-full disabled:opacity-50 ${isUnblock?"btn-primary":"bg-red-600 text-white hover:bg-red-700"}`}>{busy?"処理中…":isUnblock?"解除する":"架電禁止に設定する"}</button>
+ </Modal>;
+}
+function LeadImportModal({member,existing,close,saved,notify}:{member:string;existing:Company[];close:()=>void;saved:(summary:{inserted:number;skipped:number;blocked:number})=>void;notify:(s:string)=>void}) {const [raw,setRaw]=useState("株式会社サンプル商事,076-000-0000,https://example.com\n石川採用テック 076-111-2222 www.example.jp");const [defaults,setDefaults]=useState({industry:"",location:"石川県",source:""});const [busy,setBusy]=useState(false);const leads=useMemo(()=>parseLeadRows(raw,member,existing,defaults),[raw,member,existing,defaults]);
+ const submit=async()=>{if(!leads.length)return;setBusy(true);try{
+  const rows:BulkRowInput[]=leads.map(l=>({name:l.name,phone:l.phone,website_url:l.website_url,location:l.location,industry:l.industry,list_source:l.list_source}));
+  const {results}=await createCompaniesChecked(rows,member,"skip");
+  const inserted=results.filter(r=>r.status==="inserted").length;
+  const skipped=results.filter(r=>r.status==="skipped").length;
+  const blocked=results.filter(r=>r.status==="blocked").length;
+  saved({inserted,skipped,blocked});
+ }catch(e){notify(e instanceof Error?e.message:"取り込みに失敗しました")}finally{setBusy(false)}};
+ return <Modal title="営業先リストを自動取り込み" sub="CSV・表・Webページからコピーしたテキストを貼ると、会社名・電話番号・URLを抽出します" close={close}><div className="grid gap-3 sm:grid-cols-3"><Field l="既定の業種" v={defaults.industry} set={v=>setDefaults(d=>({...d,industry:v}))}/><Field l="既定の所在地" v={defaults.location} set={v=>setDefaults(d=>({...d,location:v}))}/><Field l="取得元URL" v={defaults.source} set={v=>setDefaults(d=>({...d,source:v}))}/></div><Label text="リスト貼り付け"><textarea className="input min-h-[180px] resize-y font-mono text-xs" value={raw} onChange={e=>setRaw(e.target.value)} placeholder="会社名, 電話番号, URL の順でなくてもOKです"/></Label><div className="mb-4 rounded-xl bg-slate-50 p-3 text-xs text-slate-600"><b className="block text-slate-800">取り込み候補：{leads.length}件</b><p className="mt-1 text-[10px]">会社名か電話番号が取れない行は除外します。重複・架電禁止先は登録時に自動でスキップされます。</p></div>{leads.length>0&&<div className="mb-4 max-h-44 overflow-auto rounded-xl border border-slate-100"><table className="w-full text-left text-[11px]"><thead className="bg-slate-50 text-slate-500"><tr><th className="p-2">企業名</th><th className="p-2">電話</th><th className="p-2">URL</th></tr></thead><tbody>{leads.slice(0,20).map(l=><tr key={l.id}><td className="border-t border-slate-100 p-2 font-bold">{l.name}</td><td className="border-t border-slate-100 p-2">{l.phone}</td><td className="border-t border-slate-100 p-2">{l.website_url||"未検出"}</td></tr>)}</tbody></table></div>}<button disabled={busy||!leads.length} onClick={submit} className="btn btn-primary w-full disabled:opacity-50">{busy?"取り込み中…":`${leads.length}件を登録する`}</button></Modal>}
 function ResultStat({label,value,tone}:{label:string;value:number;tone:"slate"|"emerald"|"amber"|"red"|"blue"}) { const cls={slate:"bg-slate-50 text-slate-600",emerald:"bg-emerald-50 text-emerald-700",amber:"bg-amber-50 text-amber-700",red:"bg-red-50 text-red-600",blue:"bg-blue-50 text-blue-700"}[tone]; return <div className={`rounded-xl p-3 ${cls}`}><p className="text-[10px] font-bold">{label}</p><p className="mt-1 text-xl font-extrabold">{value}</p></div> }
 function shortWarningLabel(w:string):string { if(w.includes("企業名が一致する既存データ"))return "同名企業があります"; if(w.includes("メールアドレスの形式"))return "メール形式を確認してください"; if(w.includes("URLの形式"))return "URL形式を確認してください"; return w }
 
-function CsvImportModal({member,existing,close,saved}:{member:string;existing:Company[];close:()=>void;saved:(s:{newCount:number;updatedCount:number;skippedCount:number;errorCount:number})=>void}) {
+function CsvImportModal({member,existing,close,saved,notify}:{member:string;existing:Company[];close:()=>void;saved:(s:{newCount:number;updatedCount:number;skippedCount:number;blockedCount:number;errorCount:number})=>void;notify:(s:string)=>void}) {
  const [fileName,setFileName]=useState("");
  const [headers,setHeaders]=useState<string[]>([]);
  const [dataRows,setDataRows]=useState<string[][]>([]);
@@ -211,7 +255,7 @@ function CsvImportModal({member,existing,close,saved}:{member:string;existing:Co
  const [dragOver,setDragOver]=useState(false);
  const [parsing,setParsing]=useState(false);
  const [busy,setBusy]=useState(false);
- const [result,setResult]=useState<{newCount:number;updatedCount:number;skippedCount:number;errorCount:number;errorRows:CsvRowResult[]}|null>(null);
+ const [result,setResult]=useState<{newCount:number;updatedCount:number;skippedCount:number;blockedCount:number;errorCount:number;errorRows:CsvRowResult[]}|null>(null);
  const submittingRef=useRef(false); // busyのstate反映が間に合わない連打でも二重登録しないための同期ガード
 
  const rows=useMemo(()=>headers.length?buildRows(dataRows,mapping,existing):[],[headers,dataRows,mapping,existing]);
@@ -245,31 +289,25 @@ function CsvImportModal({member,existing,close,saved}:{member:string;existing:Co
   submittingRef.current=true;
   setBusy(true);
   try{
+   // 重複・架電禁止の最終判定はサーバー側（create_companies_checked）が
+   // 最新状態に基づいて行う。クライアントの重複候補表示はプレビュー専用。
    const eligible=rows.filter(r=>!r.errors.length);
-   const toInsert=eligible.filter(r=>resolveAction(r)==="insert");
-   const toUpdate=eligible.filter(r=>resolveAction(r)==="update");
-   const skippedCount=eligible.filter(r=>resolveAction(r)==="skip").length;
+   const bulkRows:BulkRowInput[]=eligible.map(r=>({
+    name:r.name,phone:r.phone,website_url:r.website_url,location:r.location,industry:r.industry,
+    contact_name:r.contact_name,email:r.email,memo:r.memo,list_source:r.list_source||listSource,
+   }));
+   const {results}=bulkRows.length?await createCompaniesChecked(bulkRows,member,duplicateMode):{results:[]};
 
-   const drafts=toInsert.map(r=>rowToCompanyDraft(r,member,listSource));
-   const {saved:insertedOk,errors:insertErrors}=drafts.length?await saveCompaniesBulk(drafts):{saved:[],errors:[]};
-
-   const updateErrors:{index:number;message:string}[]=[];
-   let updatedOk=0;
-   for(const row of toUpdate){
-    const target=row.duplicate!.matchedExisting!;
-    try{
-     await updateCompany(target.id,buildCompanyUpdatePatch(row,target,listSource));
-     updatedOk++;
-    }catch(e){updateErrors.push({index:row.rowIndex,message:e instanceof Error?e.message:"更新に失敗しました"})}
-   }
-
-   const errorRows=[
+   const newCount=results.filter(r=>r.status==="inserted").length;
+   const updatedCount=results.filter(r=>r.status==="updated").length;
+   const skippedCount=results.filter(r=>r.status==="skipped").length;
+   const blockedCount=results.filter(r=>r.status==="blocked").length;
+   const errorRows:CsvRowResult[]=[
     ...rows.filter(r=>r.errors.length),
-    ...insertErrors.map(er=>({...toInsert[er.index],errors:[er.message]} as CsvRowResult)),
-    ...updateErrors.map(er=>({...toUpdate.find(r=>r.rowIndex===er.index)!,errors:[er.message]} as CsvRowResult)),
+    ...results.filter(r=>r.status==="error").map(r=>({...eligible[r.row-1],errors:[companySafetyErrorMessage(r.error_code||"")]})),
    ];
-   setResult({newCount:insertedOk.length,updatedCount:updatedOk,skippedCount,errorCount:errorRows.length,errorRows});
-  }finally{setBusy(false);submittingRef.current=false}
+   setResult({newCount,updatedCount,skippedCount,blockedCount,errorCount:errorRows.length,errorRows});
+  }catch(e){notify(e instanceof Error?e.message:"登録に失敗しました")}finally{setBusy(false);submittingRef.current=false}
  };
 
  const downloadErrors=()=>{
@@ -282,10 +320,11 @@ function CsvImportModal({member,existing,close,saved}:{member:string;existing:Co
 
  if(result){
   return <Modal title="CSV一括登録の結果" close={()=>saved(result)}>
-   <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+   <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
     <ResultStat label="新規登録" value={result.newCount} tone="emerald"/>
     <ResultStat label="更新" value={result.updatedCount} tone="blue"/>
     <ResultStat label="重複スキップ" value={result.skippedCount} tone="amber"/>
+    <ResultStat label="架電禁止" value={result.blockedCount} tone="red"/>
     <ResultStat label="エラー" value={result.errorCount} tone="red"/>
    </div>
    {result.errorRows.length>0&&<div className="mt-4">
@@ -324,7 +363,15 @@ function CsvImportModal({member,existing,close,saved}:{member:string;existing:Co
  </Modal>;
 }
 
-function CompanyModal({member,close,saved}:{member:string;close:()=>void;saved:(c:Company)=>void}) {const [form,setForm]=useState({name:"",phone:"",website_url:"",source_url:"",industry:"",location:"石川県",contact_name:"",contact_department:"",heat:"低" as Heat,memo:""});const [busy,setBusy]=useState(false);const change=(k:string,v:string)=>setForm(f=>({...f,[k]:v}));const submit=async()=>{if(!form.name||!form.phone)return;setBusy(true);try{const c=await saveCompany({id:crypto.randomUUID(),...form,website_url:normalizeUrl(form.website_url),source_url:normalizeUrl(form.source_url),owner_name:member});saved(c)}finally{setBusy(false)}};return <Modal title="企業を追加" close={close}><div className="grid gap-3 sm:grid-cols-2"><Field l="企業名 *" v={form.name} set={v=>change("name",v)}/><Field l="電話番号 *" v={form.phone} set={v=>change("phone",v)}/><Field l="公式URL" v={form.website_url} set={v=>change("website_url",v)}/><Field l="取得元URL" v={form.source_url} set={v=>change("source_url",v)}/><Field l="業種" v={form.industry} set={v=>change("industry",v)}/><Field l="所在地" v={form.location} set={v=>change("location",v)}/><Field l="担当者名" v={form.contact_name} set={v=>change("contact_name",v)}/><Field l="部署・役職" v={form.contact_department} set={v=>change("contact_department",v)}/><Label text="温度感"><select className="input" value={form.heat} onChange={e=>change("heat",e.target.value)}><option>低</option><option>中</option><option>高</option></select></Label><div className="sm:col-span-2"><Label text="メモ"><textarea className="input min-h-20" value={form.memo} onChange={e=>change("memo",e.target.value)}/></Label></div></div><button disabled={busy||!form.name||!form.phone} onClick={submit} className="btn btn-primary w-full disabled:opacity-50">{busy?"登録中…":"企業を登録する"}</button></Modal>}
+function CompanyModal({member,close,saved,notify}:{member:string;close:()=>void;saved:()=>void;notify:(s:string)=>void}) {const [form,setForm]=useState({name:"",phone:"",website_url:"",industry:"",location:"石川県",contact_name:"",memo:""});const [busy,setBusy]=useState(false);const change=(k:string,v:string)=>setForm(f=>({...f,[k]:v}));
+ const submit=async()=>{if(!form.name||!form.phone)return;setBusy(true);try{
+  const result=await createCompanyChecked({name:form.name,phone:form.phone,website_url:normalizeUrl(form.website_url),location:form.location,industry:form.industry,contact_name:form.contact_name,memo:form.memo},member,"skip");
+  if(result.status==="inserted"){saved();notify("企業を登録しました")}
+  else if(result.status==="blocked"){notify(`架電禁止に設定されている企業のため登録しませんでした（理由：${result.reason}）`)}
+  else if(result.status==="skipped"){notify("同じ電話番号または所在地の企業が既に登録されているため、登録しませんでした")}
+  else{notify("登録できませんでした")}
+ }catch(e){notify(e instanceof Error?e.message:"登録に失敗しました")}finally{setBusy(false)}};
+ return <Modal title="企業を追加" close={close}><div className="grid gap-3 sm:grid-cols-2"><Field l="企業名 *" v={form.name} set={v=>change("name",v)}/><Field l="電話番号 *" v={form.phone} set={v=>change("phone",v)}/><Field l="公式URL" v={form.website_url} set={v=>change("website_url",v)}/><Field l="業種" v={form.industry} set={v=>change("industry",v)}/><Field l="所在地" v={form.location} set={v=>change("location",v)}/><Field l="担当者名" v={form.contact_name} set={v=>change("contact_name",v)}/><div className="sm:col-span-2"><Label text="メモ"><textarea className="input min-h-20" value={form.memo} onChange={e=>change("memo",e.target.value)}/></Label></div></div><button disabled={busy||!form.name||!form.phone} onClick={submit} className="btn btn-primary w-full disabled:opacity-50">{busy?"登録中…":"企業を登録する"}</button></Modal>}
 function Field({l,v,set}:{l:string;v:string;set:(v:string)=>void}){return <Label text={l}><input className="input" value={v} onChange={e=>set(e.target.value)}/></Label>}
 function TranscriptModal({company,close,onApply}:{company?:Company;close:()=>void;onApply:(a:TranscriptAnalysis,transcript:string)=>void}) {const [text,setText]=useState("");const [analysis,setAnalysis]=useState<TranscriptAnalysis|null>(null);const [busy,setBusy]=useState(false);const run=async()=>{if(text.trim().length<15)return;setBusy(true);try{const res=await fetch("/api/analyze-transcript",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({transcript:text,company_name:company?.name})});if(!res.ok)throw new Error("解析できませんでした");setAnalysis(await res.json())}finally{setBusy(false)}};return <Modal title="✦ 通話文字起こし解析" sub="外部AI APIなしでもappserver内のルール解析で、結果・要約・次回対応を整理します" close={close}><Label text="文字起こし"><textarea className="input min-h-[190px]" value={text} onChange={e=>setText(e.target.value)} placeholder="お世話になります、OLTLの辻と申します。採用広報の件で…"/></Label><button disabled={busy||text.length<15} onClick={run} className="btn btn-ai w-full disabled:opacity-50"><Sparkles size={15}/>{busy?"解析中…":"appserverで解析する"}</button>{analysis&&<div className="mt-4 border-t border-slate-100 pt-4"><div className="grid grid-cols-2 gap-2"><Analysis l="架電結果" v={analysis.result}/><Analysis l="温度感" v={analysis.heat}/><Analysis l="次回対応" v={analysis.next_action}/><Analysis l="検出した担当者" v={analysis.contact_name||"検出できず"}/></div><div className="mt-2 rounded-lg bg-violet-50 p-3 text-xs leading-6"><b className="block text-violet-700">解析要約</b>{analysis.summary}</div><p className="mt-2 text-right text-[9px] text-slate-400">解析信頼度 {Math.round(analysis.confidence*100)}%</p><button className="btn btn-primary mt-3 w-full" onClick={()=>onApply(analysis,text)}>架電記録に反映する</button></div>}</Modal>}
 function Analysis({l,v}:{l:string;v:string}){return <div className="rounded-lg bg-slate-50 p-3"><small className="block text-[9px] text-slate-500">{l}</small><b className="mt-1 block text-xs">{v}</b></div>}

@@ -1,95 +1,36 @@
--- CallFlow CRM 本番データベース
-create extension if not exists "pgcrypto";
-
-create table public.organizations (
-  id uuid primary key default gen_random_uuid(),
-  name text not null,
-  created_at timestamptz not null default now()
-);
-
-create table public.profiles (
-  id uuid primary key references auth.users(id) on delete cascade,
-  organization_id uuid not null references public.organizations(id) on delete cascade,
-  full_name text not null,
-  role text not null default 'member' check (role in ('admin','member')),
-  active boolean not null default true,
-  created_at timestamptz not null default now()
-);
-
-create table public.companies (
-  id uuid primary key default gen_random_uuid(),
-  organization_id uuid not null references public.organizations(id) on delete cascade,
-  name text not null,
-  industry text not null default '', location text not null default '', phone text not null,
-  website_url text, source_url text, list_source text, email text,
-  contact_name text not null default '', contact_department text not null default '',
-  heat text not null default '低' check (heat in ('高','中','低')),
-  owner_id uuid references public.profiles(id) on delete set null,
-  memo text not null default '', last_called_at timestamptz, next_action_at timestamptz,
-  created_at timestamptz not null default now(), updated_at timestamptz not null default now()
-);
-
-create table public.call_logs (
-  id uuid primary key default gen_random_uuid(),
-  organization_id uuid not null references public.organizations(id) on delete cascade,
-  company_id uuid not null references public.companies(id) on delete restrict,
-  caller_id uuid not null references public.profiles(id) on delete restrict,
-  result text not null check (result in ('アポ獲得','資料送付','再架電','担当者不在','見込みなし','その他')),
-  note text not null default '', transcript text, ai_summary text, ai_fields jsonb,
-  next_action_at timestamptz, created_at timestamptz not null default now()
-);
-
-create index companies_org_idx on public.companies(organization_id);
-create index companies_next_action_idx on public.companies(organization_id,next_action_at);
-create index call_logs_org_created_idx on public.call_logs(organization_id,created_at desc);
-create index call_logs_company_idx on public.call_logs(company_id);
-
-create or replace function public.set_updated_at() returns trigger language plpgsql as $$
-begin new.updated_at=now(); return new; end $$;
-create trigger companies_set_updated_at before update on public.companies for each row execute function public.set_updated_at();
-
-alter table public.organizations enable row level security;
-alter table public.profiles enable row level security;
-alter table public.companies enable row level security;
-alter table public.call_logs enable row level security;
-
-create or replace function public.current_organization_id() returns uuid
-language sql stable security definer
-set search_path = ''
-as $$
-  select organization_id from public.profiles where id = auth.uid() and active = true
-$$;
-
-revoke all on function public.current_organization_id() from public, anon, authenticated;
-grant execute on function public.current_organization_id() to authenticated;
-
-create policy "organization members read organization" on public.organizations for select using (id=public.current_organization_id());
-create policy "organization members read profiles" on public.profiles for select using (organization_id=public.current_organization_id());
-create policy "organization members read companies" on public.companies for select using (organization_id=public.current_organization_id());
-create policy "organization members insert companies" on public.companies for insert with check (organization_id=public.current_organization_id());
-create policy "organization members update companies" on public.companies for update using (organization_id=public.current_organization_id()) with check (organization_id=public.current_organization_id());
-create policy "admins delete companies" on public.companies for delete using (organization_id=public.current_organization_id() and exists(select 1 from public.profiles p where p.id=auth.uid() and p.role='admin'));
-create policy "organization members read logs" on public.call_logs for select using (organization_id=public.current_organization_id());
-create policy "organization members insert logs" on public.call_logs for insert with check (organization_id=public.current_organization_id() and caller_id=auth.uid());
-create policy "admins update logs" on public.call_logs for update using (organization_id=public.current_organization_id() and exists(select 1 from public.profiles p where p.id=auth.uid() and p.role='admin'));
-
--- 最初の組織と管理者は、Supabase Authenticationでユーザー作成後に以下を実行します。
--- insert into organizations(name) values ('OLTL') returning id;
--- insert into profiles(id,organization_id,full_name,role) values ('AUTH_USER_UUID','ORG_UUID','辻 保','admin');
-
--- 既にこのschema.sqlを実行済みの既存プロジェクトでは、emailカラムが無いため
--- add-company-email-column.sql を別途実行してください（このファイルは新規プロジェクト用）。
-
-
 -- =========================================================
--- 企業安全管理（重複検出・架電禁止）
--- 以下は supabase/add-company-safety-stage-a.sql と同内容です。
--- 新規プロジェクトではこのschema.sqlの実行だけで完結しますが、
--- 既にこのファイルの旧版（企業安全管理を含まない版）を実行済みの
--- 既存プロジェクトでは、代わりに add-company-safety-stage-a.sql を
--- 別途実行してください。
+-- CallFlow CRM: 企業安全管理（重複検出・架電禁止）段階A
+-- 既存オブジェクトの削除・再作成は最小限（下記2件のみ）で、それ以外は追加のみです。
+--
+-- 既存オブジェクトへの変更（この2件のみ）：
+--   1. public.record_call() の置き換え（署名・返り値・security invoker は維持）
+--   2. call_logs.company_id の外部キーを ON DELETE CASCADE → ON DELETE RESTRICT へ
+-- 上記以外の既存テーブル・既存RLSポリシー・public.current_organization_id()の
+-- ロジックは削除・変更しません（current_organization_id()はsearch_path等の
+-- ハードニングのみ、ロジックは無変更でCREATE OR REPLACEします）。
+--
+-- 適用前に必ず内容を確認し、承認を得てから実行してください。
+--
+-- このファイルはマイグレーション管理下で1回だけ適用することを想定しています。
+-- CREATE TABLE等を含むため、誤って2回連続で実行した場合は「already exists」
+-- エラーで失敗しますが、begin/commitのトランザクション全体がロールバック
+-- されるため、中途半端な状態で一部だけ適用されることはありません
+-- （2026-07-18、隔離環境で実証済み）。ロールバック実行後にこのファイルを
+-- 再適用するケース（rollback-company-safety-stage-a.sql → 本ファイル）は
+-- 正常に完了することも別途確認済みです。
+--
+-- 全ての書き込み系RPC（create_company_checked / update_company_checked /
+-- create_companies_checked / block_company_calls / unblock_company_calls /
+-- record_call）は、必ず次の順序でロックを取得します。この順序を逆にする
+-- 実装を今後追加しないでください（デッドロック・レース条件の温床になります）。
+--   1. organization advisory lock（acquire_organization_lock）
+--   2. profileとorganizationの再確認（active状態・組織一致）
+--   3. registration advisory locks（電話/ドメイン/企業名+所在地。該当関数のみ）
+--   4. 対象企業・禁止状態・重複状態の再取得（ロック取得後の最新値で判定）
+--   5. 書き込み
 -- =========================================================
 
+begin;
 
 -- ---------------------------------------------------------
 -- 0. 正規化関数（電話番号・ドメイン・企業名・所在地）
@@ -1323,3 +1264,4 @@ begin
 end;
 $$;
 
+commit;

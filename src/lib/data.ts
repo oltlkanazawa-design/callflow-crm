@@ -1,20 +1,15 @@
 import { createClient, isDemoModeAllowed, isSupabaseConfigured } from "./supabase/client";
 import { demoCompanies, demoLogs, demoMembers } from "./demo-data";
 import { memberErrorMessage, filterActivePendingInvitations } from "./members";
+import { normalizePhone, urlDomain, normalizeName } from "./csv-import";
+import { companySafetyErrorMessage } from "./company-safety";
+import type { OnDuplicate, MatchScope, CheckCompanySafetyResult, CheckedWriteResult, CreateCompaniesCheckedResult, BulkRowResult, BlocklistEntry } from "./company-safety";
 import type { CallLog, Company, Member, MemberInvitation, MemberRole } from "./types";
-
-// Supabaseの技術的なエラーメッセージのうち、既知のパターンは営業担当にも分かる文言へ変換する
-function friendlyDbErrorMessage(error: { message?: string } | null | undefined, fallback: string): string {
-  const msg = error?.message || "";
-  if (/email/i.test(msg) && /(does not exist|could not find)/i.test(msg)) {
-    return "emailの列がデータベースにまだ追加されていません（add-company-email-column.sqlの実行が必要です）";
-  }
-  return msg || fallback;
-}
 
 const COMPANY_KEY = "callflow_companies_v1";
 const LOG_KEY = "callflow_logs_v1";
 const MEMBER_KEY = "callflow_members_v1";
+const BLOCKLIST_KEY = "callflow_blocklist_v1";
 
 function readLocal<T>(key: string, fallback: T): T {
   if (typeof window === "undefined") return fallback;
@@ -37,15 +32,19 @@ export async function loadCRMData(): Promise<CRMData> {
     if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
     const members = readLocal(MEMBER_KEY, demoMembers);
     const me = members[0];
+    const companies = applyDemoBlocklist(readLocal(COMPANY_KEY, demoCompanies));
     return {
-      companies: readLocal(COMPANY_KEY, demoCompanies), logs: readLocal(LOG_KEY, demoLogs),
+      companies, logs: readLocal(LOG_KEY, demoLogs),
       activeMembers: members.filter(m => m.active), allMembers: members, pendingInvitations: [],
       currentUserId: me?.id || "", currentUser: me?.full_name || "辻 保", isAdmin: me?.role === "admin",
     };
   }
   const supabase = createClient();
+  // companies_with_call_status はLATERAL JOINを含むビューのため、PostgRESTの外部キー
+  // 埋め込み（profiles!companies_owner_id_fkey等）を頼らず、profilesは別途取得して
+  // owner_idから手動で名前を解決する（ビュー経由でも確実に動く方式）。
   const [{ data: companies, error: ce }, { data: logs, error: le }, { data: profiles, error: pe }, { data: auth }] = await Promise.all([
-    supabase.from("companies").select("*, profiles!companies_owner_id_fkey(full_name)").order("created_at", { ascending: false }),
+    supabase.from("companies_with_call_status").select("*").order("created_at", { ascending: false }),
     supabase.from("call_logs").select("*, companies(name), profiles!call_logs_caller_id_fkey(full_name)").order("created_at", { ascending: false }).limit(500),
     supabase.from("profiles").select("id,full_name,email,role,active,created_at").order("full_name"),
     supabase.auth.getUser(),
@@ -73,93 +72,13 @@ export async function loadCRMData(): Promise<CRMData> {
     pendingInvitations = filterActivePendingInvitations((invitations || []) as MemberInvitation[]);
   }
 
+  const ownerNameById = new Map(allMembers.map(m => [m.id, m.full_name]));
   return {
-    companies: (companies || []).map((c: Record<string, unknown>) => ({ ...c, owner_name: (c.profiles as { full_name?: string } | null)?.full_name || "未割当" })) as Company[],
+    companies: (companies || []).map((c: Record<string, unknown>) => ({ ...c, owner_name: ownerNameById.get(c.owner_id as string) || "未割当" })) as Company[],
     logs: (logs || []).map((l: Record<string, unknown>) => ({ ...l, company_name: (l.companies as { name?: string } | null)?.name || "削除済み", caller_name: (l.profiles as { full_name?: string } | null)?.full_name || "不明" })) as CallLog[],
     activeMembers: allMembers.filter(m => m.active), allMembers, pendingInvitations,
     currentUserId: auth.user?.id || "", currentUser, isAdmin,
   };
-}
-
-export async function saveCompany(company: Company): Promise<Company> {
-  if (!isSupabaseConfigured) {
-    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
-    const current = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
-    localStorage.setItem(COMPANY_KEY, JSON.stringify([company, ...current]));
-    return company;
-  }
-  const supabase = createClient();
-  const { data: auth } = await supabase.auth.getUser();
-  if (!auth.user) throw new Error("ログインが必要です");
-  const { data: profile, error: profileError } = await supabase.from("profiles").select("organization_id,id").eq("id",auth.user.id).single();
-  if (profileError) throw profileError;
-  const { data, error } = await supabase.from("companies").insert({
-    organization_id: profile!.organization_id, name: company.name, industry: company.industry,
-    location: company.location, phone: company.phone, website_url: company.website_url || null,
-    source_url: company.source_url || null, list_source: company.list_source || null, contact_name: company.contact_name,
-    contact_department: company.contact_department, heat: company.heat, memo: company.memo,
-    owner_id: profile!.id,
-  }).select().single();
-  if (error) throw error;
-  return { ...data, owner_name: company.owner_name } as Company;
-}
-
-export async function saveCompaniesBulk(companies: Company[]): Promise<{ saved: Company[]; errors: { index: number; message: string }[] }> {
-  if (!companies.length) return { saved: [], errors: [] };
-  if (!isSupabaseConfigured) {
-    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
-    try {
-      const current = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
-      localStorage.setItem(COMPANY_KEY, JSON.stringify([...companies, ...current]));
-      return { saved: companies, errors: [] };
-    } catch (e) {
-      return { saved: [], errors: companies.map((_, index) => ({ index, message: e instanceof Error ? e.message : "保存に失敗しました" })) };
-    }
-  }
-  const supabase = createClient();
-  const { data: auth } = await supabase.auth.getUser();
-  if (!auth.user) throw new Error("ログインが必要です");
-  const { data: profile, error: profileError } = await supabase.from("profiles").select("organization_id,id").eq("id", auth.user.id).single();
-  if (profileError) throw profileError;
-
-  const toRow = (c: Company) => ({
-    organization_id: profile!.organization_id, name: c.name, industry: c.industry, location: c.location, phone: c.phone,
-    website_url: c.website_url || null, source_url: c.source_url || null, list_source: c.list_source || null, email: c.email || null,
-    contact_name: c.contact_name, contact_department: c.contact_department, heat: c.heat, memo: c.memo, owner_id: profile!.id,
-  });
-
-  const saved: Company[] = [];
-  const errors: { index: number; message: string }[] = [];
-  const chunkSize = 25;
-  for (let start = 0; start < companies.length; start += chunkSize) {
-    const chunk = companies.slice(start, start + chunkSize);
-    const { data, error } = await supabase.from("companies").insert(chunk.map(toRow)).select();
-    if (!error && data) {
-      saved.push(...(data.map((d, i) => ({ ...d, owner_name: chunk[i].owner_name })) as Company[]));
-      continue;
-    }
-    // チャンク全体のinsertが失敗した場合のみ、原因の行を特定するため1件ずつ登録し直す
-    for (let i = 0; i < chunk.length; i++) {
-      const { data: single, error: singleError } = await supabase.from("companies").insert(toRow(chunk[i])).select().single();
-      if (singleError) errors.push({ index: start + i, message: friendlyDbErrorMessage(singleError, "登録に失敗しました") });
-      else saved.push({ ...single, owner_name: chunk[i].owner_name } as Company);
-    }
-  }
-  return { saved, errors };
-}
-
-export async function updateCompany(id: string, patch: Partial<Omit<Company, "id" | "owner_name">>): Promise<Company> {
-  if (!isSupabaseConfigured) {
-    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
-    const current = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
-    const updated = current.map(c => c.id === id ? { ...c, ...patch } : c);
-    localStorage.setItem(COMPANY_KEY, JSON.stringify(updated));
-    return updated.find(c => c.id === id)!;
-  }
-  const supabase = createClient();
-  const { data, error } = await supabase.from("companies").update(patch).eq("id", id).select().single();
-  if (error) throw new Error(friendlyDbErrorMessage(error, "更新に失敗しました"));
-  return { ...data, owner_name: "" } as Company;
 }
 
 export async function saveCallLog(log: CallLog, company: Company): Promise<void> {
@@ -173,7 +92,7 @@ export async function saveCallLog(log: CallLog, company: Company): Promise<void>
   }
   const supabase = createClient();
   const { error } = await supabase.rpc("record_call",{p_company_id:company.id,p_result:log.result,p_note:log.note,p_transcript:log.transcript||null,p_ai_summary:log.ai_summary||null,p_next_action_at:log.next_action_at||null,p_heat:company.heat});
-  if (error) throw error;
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
 }
 
 export async function inviteMember(email: string, fullName: string, role: MemberRole): Promise<Member | MemberInvitation> {
@@ -264,4 +183,299 @@ export async function updateMemberName(memberId: string, fullName: string): Prom
   const { data, error } = await supabase.rpc("update_member_name", { member_id: memberId, new_full_name: name });
   if (error) throw new Error(memberErrorMessage(error.message));
   return data as Member;
+}
+
+// ===========================================================
+// 企業安全管理（重複検出・架電禁止）
+// デモモードにはcall_blocklistテーブルが無いため、localStorageで最小限の
+// 同等機能（企業ごとの禁止設定・電話/URL/企業名+所在地での照合）を再現する。
+// ===========================================================
+
+interface DemoBlockEntry {
+  id: string; company_id: string | null;
+  normalized_phone: string | null; normalized_domain: string | null;
+  normalized_name: string | null; normalized_location: string | null;
+  match_scope: MatchScope; reason: string; active: boolean; created_at: string;
+}
+
+function readBlocklist(): DemoBlockEntry[] { return readLocal<DemoBlockEntry[]>(BLOCKLIST_KEY, []); }
+function writeBlocklist(list: DemoBlockEntry[]) { localStorage.setItem(BLOCKLIST_KEY, JSON.stringify(list)); }
+
+function normalizeCompanyKeys(input: { name?: string; phone?: string; website_url?: string; location?: string }) {
+  return {
+    phone: normalizePhone(input.phone || ""),
+    domain: urlDomain(input.website_url || ""),
+    name: normalizeName(input.name || ""),
+    location: normalizeName(input.location || ""),
+  };
+}
+
+// match_scopeを厳密に適用する。SQL側のmatch_active_blocklist()と同じ優先順位・
+// 同じ判定（保存列の非NULLだけに頼らず、match_scopeそのものも必ず確認する）
+function matchDemoBlocklist(list: DemoBlockEntry[], keys: { phone: string; domain: string; name: string; location: string }): DemoBlockEntry | null {
+  const active = list.filter(b => b.active);
+  if (keys.phone) {
+    const hit = active.find(b => (b.match_scope === "phone" || b.match_scope === "strict") && b.normalized_phone === keys.phone);
+    if (hit) return hit;
+  }
+  if (keys.domain) {
+    const hit = active.find(b => (b.match_scope === "domain" || b.match_scope === "strict") && b.normalized_domain === keys.domain);
+    if (hit) return hit;
+  }
+  if (keys.name && keys.location) {
+    const hit = active.find(b => (b.match_scope === "name_location" || b.match_scope === "strict") && b.normalized_name === keys.name && b.normalized_location === keys.location);
+    if (hit) return hit;
+  }
+  if (keys.name) {
+    const hit = active.find(b => b.match_scope === "name_only" && b.normalized_name === keys.name);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function applyDemoBlocklist(companies: Company[]): Company[] {
+  const list = readBlocklist();
+  if (!list.length) return companies;
+  return companies.map(c => {
+    const match = matchDemoBlocklist(list, normalizeCompanyKeys(c));
+    if (!match) return c;
+    return { ...c, call_prohibited: true, blocklist_id: match.id, blocked_scope: match.match_scope, blocked_reason: match.reason };
+  });
+}
+
+function findDemoDuplicate(companies: Company[], keys: { phone: string; domain: string; name: string; location: string }, excludeId?: string): Company | null {
+  const pool = excludeId ? companies.filter(c => c.id !== excludeId) : companies;
+  if (keys.phone) { const hit = pool.find(c => normalizePhone(c.phone) === keys.phone); if (hit) return hit; }
+  if (keys.domain) { const hit = pool.find(c => urlDomain(c.website_url || "") === keys.domain); if (hit) return hit; }
+  if (keys.name && keys.location) {
+    const hit = pool.find(c => normalizeName(c.name) === keys.name && normalizeName(c.location) === keys.location);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+const VALID_ON_DUPLICATE: OnDuplicate[] = ["skip", "update", "insert"];
+
+export async function checkCompanySafety(name: string, phone: string, websiteUrl: string, location: string): Promise<CheckCompanySafetyResult> {
+  const keys = normalizeCompanyKeys({ name, phone, website_url: websiteUrl, location });
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const companies = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+    const block = matchDemoBlocklist(readBlocklist(), keys);
+    const dup = findDemoDuplicate(companies, keys);
+    return {
+      blocked: Boolean(block),
+      block_matches: block ? [{ blocklist_id: block.id, matched_scope: block.match_scope, reason: block.reason }] : [],
+      duplicate_candidates: dup ? [{ tier: keys.phone && normalizePhone(dup.phone) === keys.phone ? "phone" : keys.domain && urlDomain(dup.website_url || "") === keys.domain ? "domain" : "name_location", company_id: dup.id }] : [],
+    };
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("check_company_safety", { p_name: name, p_phone: phone, p_website_url: websiteUrl || null, p_location: location });
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
+  return data as CheckCompanySafetyResult;
+}
+
+export interface CompanyDraftInput {
+  name: string; phone: string; website_url?: string; location: string;
+  industry?: string; contact_name?: string; email?: string; memo?: string; list_source?: string;
+}
+
+// 禁止先に一致した企業は、いかなる引数によっても登録を迂回できない
+// （p_acknowledge_blocklistのような迂回引数は存在しない）
+export async function createCompanyChecked(input: CompanyDraftInput, owner: string, onDuplicate: OnDuplicate = "skip"): Promise<CheckedWriteResult> {
+  if (!VALID_ON_DUPLICATE.includes(onDuplicate)) throw new Error(companySafetyErrorMessage("invalid_on_duplicate"));
+  const keys = normalizeCompanyKeys(input);
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    if (!keys.name) throw new Error(companySafetyErrorMessage("name_required"));
+    const block = matchDemoBlocklist(readBlocklist(), keys);
+    if (block) return { status: "blocked", blocklist_id: block.id, matched_scope: block.match_scope, reason: block.reason };
+    const companies = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+    const dup = findDemoDuplicate(companies, keys);
+    if (dup && onDuplicate === "skip") return { status: "skipped", existing_company_id: dup.id };
+    if (dup && onDuplicate === "update") return { status: "needs_explicit_update", existing_company_id: dup.id };
+    const newCompany: Company = {
+      id: crypto.randomUUID(), name: input.name, industry: input.industry || "", location: input.location, phone: input.phone,
+      website_url: input.website_url || undefined, email: input.email || undefined, list_source: input.list_source,
+      contact_name: input.contact_name || "", contact_department: "", heat: "低", owner_name: owner, memo: input.memo || "",
+    };
+    localStorage.setItem(COMPANY_KEY, JSON.stringify([newCompany, ...companies]));
+    return { status: "inserted", company: newCompany as unknown as Record<string, unknown> };
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("create_company_checked", {
+    p_name: input.name, p_phone: input.phone, p_website_url: input.website_url || null, p_location: input.location,
+    p_industry: input.industry || "", p_contact_name: input.contact_name || "", p_email: input.email || null,
+    p_memo: input.memo || "", p_list_source: input.list_source || null,
+    p_on_duplicate: onDuplicate,
+  });
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
+  return data as CheckedWriteResult;
+}
+
+export interface BulkRowInput extends CompanyDraftInput { on_duplicate?: OnDuplicate }
+
+export async function createCompaniesChecked(rows: BulkRowInput[], owner: string, defaultOnDuplicate: OnDuplicate = "skip"): Promise<CreateCompaniesCheckedResult> {
+  if (!rows.length) return { results: [] };
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const blocklist = readBlocklist();
+    const seenPhones = new Set<string>(), seenDomains = new Set<string>(), seenNameLocs = new Set<string>();
+    const results: BulkRowResult[] = [];
+    const toAdd: Company[] = [];
+    let working = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+
+    const markSeen = (k: { phone: string; domain: string; name: string; location: string }) => {
+      if (k.phone) seenPhones.add(k.phone);
+      if (k.domain) seenDomains.add(k.domain);
+      if (k.name && k.location) seenNameLocs.add(`${k.name}|${k.location}`);
+    };
+
+    rows.forEach((row, i) => {
+      const rowNum = i + 1;
+      const onDup = row.on_duplicate || defaultOnDuplicate;
+      if (!VALID_ON_DUPLICATE.includes(onDup)) {
+        results.push({ row: rowNum, status: "error", error_code: "invalid_on_duplicate" });
+        return;
+      }
+      const keys = normalizeCompanyKeys(row);
+      if (!keys.name) { results.push({ row: rowNum, status: "error", error_code: "name_required" }); return; }
+      const withinCsv = (keys.phone && seenPhones.has(keys.phone)) || (keys.domain && seenDomains.has(keys.domain)) || (keys.name && keys.location && seenNameLocs.has(`${keys.name}|${keys.location}`));
+      if (withinCsv) { results.push({ row: rowNum, status: "skipped", reason: "duplicate_within_csv" }); return; }
+
+      const block = matchDemoBlocklist(blocklist, keys);
+      if (block) {
+        results.push({ row: rowNum, status: "blocked", blocklist_id: block.id, matched_scope: block.match_scope });
+        markSeen(keys);
+        return;
+      }
+
+      const dup = findDemoDuplicate([...working, ...toAdd], keys);
+      if (dup && onDup === "skip") {
+        results.push({ row: rowNum, status: "skipped", existing_company_id: dup.id });
+        markSeen(keys);
+        return;
+      }
+      if (dup && onDup === "update") {
+        // 実効値（CSVが空欄なら既存値のまま）を合成してから禁止・重複を再判定する。
+        // 空欄入力で既存の禁止一致キーを外して禁止判定を回避できないようにするため。
+        const effective = {
+          name: row.name || dup.name, phone: row.phone || dup.phone,
+          website_url: row.website_url || dup.website_url, location: row.location || dup.location,
+        };
+        const effKeys = normalizeCompanyKeys(effective);
+        const effBlock = matchDemoBlocklist(blocklist, effKeys);
+        if (effBlock) {
+          results.push({ row: rowNum, status: "blocked", blocklist_id: effBlock.id, matched_scope: effBlock.match_scope });
+          markSeen(effKeys);
+          return;
+        }
+        const conflicting = findDemoDuplicate([...working, ...toAdd], effKeys, dup.id);
+        if (conflicting) {
+          results.push({ row: rowNum, status: "skipped", reason: "duplicate_conflict", conflicting_company_id: conflicting.id });
+          markSeen(effKeys);
+          return;
+        }
+        working = working.map(c => c.id === dup.id ? {
+          ...c, name: effective.name, phone: effective.phone, website_url: effective.website_url, location: effective.location,
+          industry: row.industry || c.industry, contact_name: row.contact_name || c.contact_name,
+          email: row.email || c.email, memo: row.memo || c.memo, list_source: row.list_source || c.list_source,
+        } : c);
+        results.push({ row: rowNum, status: "updated", company_id: dup.id });
+        markSeen(effKeys);
+        return;
+      }
+
+      const newCompany: Company = {
+        id: crypto.randomUUID(), name: row.name, industry: row.industry || "", location: row.location, phone: row.phone,
+        website_url: row.website_url || undefined, email: row.email || undefined, list_source: row.list_source,
+        contact_name: row.contact_name || "", contact_department: "", heat: "低", owner_name: owner, memo: row.memo || "",
+      };
+      toAdd.push(newCompany);
+      results.push({ row: rowNum, status: "inserted", company_id: newCompany.id });
+      markSeen(keys);
+    });
+
+    localStorage.setItem(COMPANY_KEY, JSON.stringify([...toAdd, ...working]));
+    return { results };
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("create_companies_checked", {
+    p_rows: rows.map(r => ({ name: r.name, phone: r.phone, website_url: r.website_url || null, location: r.location, industry: r.industry || "", contact_name: r.contact_name || "", email: r.email || null, memo: r.memo || "", list_source: r.list_source || null, on_duplicate: r.on_duplicate })),
+    p_default_on_duplicate: defaultOnDuplicate,
+  });
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
+  return data as CreateCompaniesCheckedResult;
+}
+
+export async function blockCompanyCalls(companyId: string, reason: string, matchScope: MatchScope = "strict"): Promise<BlocklistEntry> {
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const companies = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+    const target = companies.find(c => c.id === companyId);
+    if (!target) throw new Error(companySafetyErrorMessage("company_not_found_in_your_organization"));
+    if (!reason.trim()) throw new Error(companySafetyErrorMessage("reason_required"));
+    const keys = normalizeCompanyKeys(target);
+
+    if (matchScope === "phone" && !keys.phone) throw new Error(companySafetyErrorMessage("phone_required_for_scope"));
+    if (matchScope === "domain" && !keys.domain) throw new Error(companySafetyErrorMessage("domain_required_for_scope"));
+    if (matchScope === "name_location" && (!keys.name || !keys.location)) throw new Error(companySafetyErrorMessage("name_and_location_required_for_scope"));
+    if (matchScope === "name_only" && !keys.name) throw new Error(companySafetyErrorMessage("name_required_for_scope"));
+    if (matchScope === "strict" && !keys.phone && !keys.domain && !(keys.name && keys.location)) throw new Error(companySafetyErrorMessage("identifier_required"));
+
+    const list = readBlocklist();
+    const existing = list.find(b => b.active && b.match_scope === matchScope && (
+      (matchScope === "phone" && b.normalized_phone === keys.phone)
+      || (matchScope === "domain" && b.normalized_domain === keys.domain)
+      || (matchScope === "name_location" && b.normalized_name === keys.name && b.normalized_location === keys.location)
+      || (matchScope === "name_only" && b.normalized_name === keys.name)
+      || (matchScope === "strict" && (
+        (Boolean(keys.phone) && b.normalized_phone === keys.phone)
+        || (Boolean(keys.domain) && b.normalized_domain === keys.domain)
+        || (Boolean(keys.name && keys.location) && b.normalized_name === keys.name && b.normalized_location === keys.location)
+      ))
+    ));
+    const toEntry = (e: DemoBlockEntry): BlocklistEntry => ({
+      id: e.id, organization_id: "", company_id: e.company_id, snapshot_name: target.name, snapshot_location: target.location,
+      snapshot_phone: target.phone, snapshot_domain: target.website_url || null, match_scope: e.match_scope, reason: e.reason,
+      note: "", active: e.active, created_by: "", created_at: e.created_at, updated_by: null, updated_at: e.created_at,
+    });
+    if (existing) return toEntry(existing);
+
+    // 選択したscopeに必要な正規化キーだけを保存する（strictのみ、利用可能な強一致キーをすべて保存する）
+    const entry: DemoBlockEntry = {
+      id: crypto.randomUUID(), company_id: companyId,
+      normalized_phone: (matchScope === "phone" || matchScope === "strict") ? (keys.phone || null) : null,
+      normalized_domain: (matchScope === "domain" || matchScope === "strict") ? (keys.domain || null) : null,
+      normalized_name: (matchScope === "name_location" || matchScope === "name_only" || matchScope === "strict") ? (keys.name || null) : null,
+      normalized_location: (matchScope === "name_location" || matchScope === "strict") ? (keys.location || null) : null,
+      match_scope: matchScope, reason: reason.trim(), active: true, created_at: new Date().toISOString(),
+    };
+    writeBlocklist([...list, entry]);
+    return toEntry(entry);
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("block_company_calls", { p_company_id: companyId, p_phone: null, p_website_url: null, p_name: null, p_location: null, p_match_scope: matchScope, p_reason: reason });
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
+  return data as BlocklistEntry;
+}
+
+export async function unblockCompanyCalls(blocklistId: string, reason: string): Promise<BlocklistEntry> {
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    if (!reason.trim()) throw new Error(companySafetyErrorMessage("reason_required"));
+    const list = readBlocklist();
+    const target = list.find(b => b.id === blocklistId);
+    if (!target) throw new Error(companySafetyErrorMessage("blocklist_entry_not_found"));
+    // 既に解除済みでも技術エラーにせず、同じ行を安全に返す（冪等）
+    if (!target.active) {
+      return { id: target.id, organization_id: "", company_id: target.company_id, snapshot_name: null, snapshot_location: null, snapshot_phone: null, snapshot_domain: null, match_scope: target.match_scope, reason: target.reason, note: "", active: false, created_by: "", created_at: target.created_at, updated_by: null, updated_at: target.created_at };
+    }
+    writeBlocklist(list.map(b => b.id === blocklistId ? { ...b, active: false } : b));
+    return { id: target.id, organization_id: "", company_id: target.company_id, snapshot_name: null, snapshot_location: null, snapshot_phone: null, snapshot_domain: null, match_scope: target.match_scope, reason: target.reason, note: "", active: false, created_by: "", created_at: target.created_at, updated_by: null, updated_at: new Date().toISOString() };
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("unblock_company_calls", { p_blocklist_id: blocklistId, p_reason: reason });
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
+  return data as BlocklistEntry;
 }
