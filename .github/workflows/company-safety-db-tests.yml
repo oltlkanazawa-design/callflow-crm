@@ -162,14 +162,26 @@ jobs:
           -- 緊急ロールバックによってsearch_path=''等のセキュリティ強化が失われていないことを、
           -- pg_procのproconfigから直接確認する（関数定義のテキストではなく実際のカタログ状態）。
           do $$
-          declare v_cfg text[];
+          declare
+            v_cfg text[];
+            v_ok boolean;
           begin
+            -- proconfigの要素は search_path='' の場合 'search_path=""'（値を二重引用符で
+            -- 囲んだ形）で格納されるため、'='より後ろを引用符ごとtrimして空かどうかで判定する
             select proconfig into v_cfg from pg_proc where proname='record_call' and pronamespace='public'::regnamespace;
-            if v_cfg is null or not ('search_path=' = any(v_cfg)) then
+            v_ok := v_cfg is not null and exists (
+              select 1 from unnest(v_cfg) e
+              where split_part(e, '=', 1) = 'search_path' and btrim(substring(e from position('=' in e) + 1), '"') = ''
+            );
+            if not v_ok then
               raise exception 'FAIL: stage-Aロールバック後、record_call()のsearch_pathがハードニングされていません（proconfig: %）', v_cfg;
             end if;
             select proconfig into v_cfg from pg_proc where proname='current_organization_id' and pronamespace='public'::regnamespace;
-            if v_cfg is null or not ('search_path=' = any(v_cfg)) then
+            v_ok := v_cfg is not null and exists (
+              select 1 from unnest(v_cfg) e
+              where split_part(e, '=', 1) = 'search_path' and btrim(substring(e from position('=' in e) + 1), '"') = ''
+            );
+            if not v_ok then
               raise exception 'FAIL: stage-Aロールバック後、current_organization_id()のsearch_pathがハードニングされていません（proconfig: %）', v_cfg;
             end if;
             raise notice 'PASS: stage-Aロールバック後もrecord_call()/current_organization_id()のsearch_path=''''ハードニングが維持されている';
