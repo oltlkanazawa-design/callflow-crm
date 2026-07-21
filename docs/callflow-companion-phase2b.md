@@ -3,7 +3,7 @@
 作成日: 2026-07-21
 対象ブランチ: `feature/local-call-recorder-codex`
 
-> **注記**: このドキュメント作成時点で、実機へのHomebrew・mkcertのインストール、および実際のmkcert発行証明書を使ったChromeでの実機確認は、ユーザーの判断により**後日ご自身で実施**することになっている。以下は、その前提でコード・テスト・スクリプト・ドキュメントとして実装済みの内容と、実機インストール後にユーザーが確認すべき手順を分けて記載する。
+> **更新（2026-07-21〜22）**: Homebrew・mkcertの実機インストール、証明書発行、実マイクを使ったHTTPS音声送信の実機確認が完了した。§16「実機確認結果」を参照。
 
 ---
 
@@ -168,18 +168,33 @@ Phase 2Aと同じ。受信後は必ず一時ファイルを削除し、削除に
 
 ---
 
-## 付録: 現時点で未実施の実機確認項目
+## 16. 実機確認結果
 
-以下は、ユーザーがHomebrew・mkcertを実際にインストールした後、改めて実施が必要な項目（今回のセッションでは未実施）。
+実施日: 2026-07-21〜22
+環境: MacBook Air（Apple Silicon）、通常のGoogle Chrome（Claude Codeのサンドボックス化されたBrowser paneではない）
 
-1. `npm run companion:setup-tls` の実行（証明書発行）
-2. `npm run companion:start` でHTTPS起動
-3. Chromeで`https://callflow-companion.localhost:4318/v1/health`を開き、証明書警告が出ないことの確認
-4. `secure: true`の確認（health応答）
-5. CallFlowからの「接続を確認」・ペアリング
-6. Chromeのローカルネットワークアクセス許可ダイアログの確認・許可
-7. MacBook Airの実マイクでの5秒程度のテスト録音・アプリ内再生
-8. 「Macへ送信テスト」によるHTTPS経由の音声送信、`temporaryFileDeleted: true`の確認
-9. Supabase・Vercel・外部ドメインへの通信が0件であることの確認
+- Homebrewを`brew.sh`公式インストーラーでユーザー自身のTerminal.appから導入（このセッションのツールにはsudoの対話的TTYが無く実行不可のため）
+- `brew install mkcert`（v1.4.4）、`mkcert -install`でローカルCAをmacOSの信頼済みストアへ登録
+- `npm run companion:setup-tls` を実行し、`callflow-companion.localhost` / `localhost` / `127.0.0.1` / `::1` を含む証明書を発行（有効期限 2028-10-21、権限: 秘密鍵0600・証明書0644）
+- LibreSSL非対応の `openssl x509 -ext` オプションに依存していた証明書確認処理を修正し（`fix: support macOS LibreSSL in TLS setup`）、`bash -n`・`npm run companion:setup-tls`・`npm run companion:build`・`npm run companion:test`・`git diff --check`すべて成功を確認してからコミット
+- `npm run companion:start` でHTTPSモード起動（`https://127.0.0.1:4318`、`secure: true`）
+- 通常のGoogle Chromeで `https://callflow-companion.localhost:4318/v1/health` を開き、**証明書警告なし**（mkcertのローカルCAが正しく信頼されていることを確認）、health応答は200 OK・`secure: true`
+- `http://127.0.0.1:3002/dashboard`（デモモード、`.env.local`退避済み）でCallFlowを起動し、「接続を確認」→ペアリング成功→「Macの処理アプリ：接続済み」表示を確認
+- MacBook Airの内蔵マイクへのアクセスを許可し、実マイクで約48秒のテスト録音を実施（個人情報・実際の営業内容は使用せず、「これはCallFlowのHTTPS送信テストです」程度の内容のみ）
+- アプリ内再生で録音内容を確認
+- 「Macへ送信テスト」を押下し、HTTPS経由（`https://callflow-companion.localhost:4318/v1/audio`）で送信 → 成功
+  - MIME Type: `audio/webm;codecs=opus`
+  - 録音時間: 48秒
+  - 音声サイズ: 759.4KB
+  - 画面表示: 「音声をMacで受信し、安全に削除しました」
+  - `temporaryFileDeleted: true`
+- 送信後、Companionの一時ディレクトリ（`~/Library/Application Support/CallFlow Companion/tmp`）が空であることを確認
+- Supabase・Vercel・その他外部ドメインへの音声送信は発生していない（Companionは`127.0.0.1:4318`のみで待受け、`/v1/audio`はローカル一時保存・検証・削除のみを行い外部へは一切送信しない実装であることをコードレベルで確認済み。加えてCallFlowは`.env.local`退避によるデモモードで動作しており、Supabase接続は構成上不可能な状態だった）
 
-これらはコード・自動テスト（自己署名証明書によるHTTPS起動・CORS・PNAヘッダーの単体テストは実施済み）では代替できない実機確認であり、Phase 2Bの最終的な完了条件を満たすには、ユーザーの実機でこれらを完了する必要がある。
+**Phase 2Bの完了条件（HTTPS化・Chrome証明書信頼・HTTPS音声送信・Local Network Access確認）をすべて満たした。**
+
+---
+
+## 付録: Phase 2A/2B自動テストでカバーしている範囲
+
+自己署名証明書（openssl、テスト実行時に一時生成、mkcertのCAROOTとは無関係）によるHTTPS起動・CORS・PNAヘッダーの単体テストはコードレベルで実施済み（`companion/src/server.test.ts`）。上記§16の実機確認は、これらの自動テストでは代替できない「実際のmkcert証明書に対するChromeの信頼」「実マイクからの音声」「実ブラウザでのLocal Network Access許可」を確認するものである。
