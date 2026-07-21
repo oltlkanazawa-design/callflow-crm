@@ -66,31 +66,54 @@ chmod 0700 "$CERT_DIR"
 CERT_FILE="$CERT_DIR/companion-cert.pem"
 KEY_FILE="$CERT_DIR/companion-key.pem"
 
-# 既存証明書のバックアップ
-if [ -f "$CERT_FILE" ] || [ -f "$KEY_FILE" ]; then
-  BACKUP_DIR="$CERT_DIR/backup-$(date +%Y%m%d%H%M%S)"
-  mkdir -p "$BACKUP_DIR"
-  [ -f "$CERT_FILE" ] && cp "$CERT_FILE" "$BACKUP_DIR/"
-  [ -f "$KEY_FILE" ] && cp "$KEY_FILE" "$BACKUP_DIR/"
-  echo "既存証明書を $(basename "$BACKUP_DIR")/ へバックアップしました。"
+# 証明書のSAN確認は、macOS標準のLibreSSLが対応していない「-ext」オプションに依存せず、
+# LibreSSL・OpenSSLどちらにも存在する「-text」出力をgrepする方式で行う。
+read_san() {
+  openssl x509 -in "$1" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" || true
+}
+
+# 既に必要なSANを含む有効期限内の証明書があれば、不要な再発行はしない。
+CERT_IS_CURRENT=false
+if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+  if openssl x509 -in "$CERT_FILE" -noout -checkend 0 >/dev/null 2>&1; then
+    SAN_TEXT="$(read_san "$CERT_FILE")"
+    if echo "$SAN_TEXT" | grep -q "callflow-companion.localhost" \
+      && echo "$SAN_TEXT" | grep -q "DNS:localhost" \
+      && echo "$SAN_TEXT" | grep -q "127.0.0.1"; then
+      CERT_IS_CURRENT=true
+    fi
+  fi
 fi
 
-echo "証明書を発行します（callflow-companion.localhost, localhost, 127.0.0.1, ::1）..."
-mkcert -cert-file "$CERT_FILE" -key-file "$KEY_FILE" \
-  callflow-companion.localhost localhost 127.0.0.1 ::1
+if [ "$CERT_IS_CURRENT" = true ]; then
+  echo "既存の証明書は有効期限内で、必要なSANを含んでいるため再発行しません。"
+else
+  # 既存証明書のバックアップ
+  if [ -f "$CERT_FILE" ] || [ -f "$KEY_FILE" ]; then
+    BACKUP_DIR="$CERT_DIR/backup-$(date +%Y%m%d%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+    [ -f "$CERT_FILE" ] && cp "$CERT_FILE" "$BACKUP_DIR/"
+    [ -f "$KEY_FILE" ] && cp "$KEY_FILE" "$BACKUP_DIR/"
+    echo "既存証明書を $(basename "$BACKUP_DIR")/ へバックアップしました。"
+  fi
 
-chmod 0600 "$KEY_FILE"
-chmod 0644 "$CERT_FILE"
+  echo "証明書を発行します（callflow-companion.localhost, localhost, 127.0.0.1, ::1）..."
+  mkcert -cert-file "$CERT_FILE" -key-file "$KEY_FILE" \
+    callflow-companion.localhost localhost 127.0.0.1 ::1
+
+  chmod 0600 "$KEY_FILE"
+  chmod 0644 "$CERT_FILE"
+fi
 
 echo ""
-echo "=== 発行結果 ==="
+echo "=== 証明書の状態 ==="
 echo "証明書ディレクトリ: $(basename "$CERT_DIR")/"
 echo "証明書ファイル名: $(basename "$CERT_FILE")（権限: $(stat -f "%Lp" "$CERT_FILE")）"
 echo "秘密鍵ファイル名: $(basename "$KEY_FILE")（権限: $(stat -f "%Lp" "$KEY_FILE")）"
 echo ""
 echo "--- 証明書の有効期限・SAN（秘密鍵の内容は表示しません） ---"
 openssl x509 -in "$CERT_FILE" -noout -dates
-openssl x509 -in "$CERT_FILE" -noout -ext subjectAltName
+read_san "$CERT_FILE"
 
 echo ""
 echo "セットアップが完了しました。"
