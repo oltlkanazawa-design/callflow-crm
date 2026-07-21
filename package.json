@@ -8,7 +8,12 @@
     "build": "next build",
     "start": "next start --hostname 0.0.0.0",
     "lint": "eslint",
-    "test": "node --test src/lib/*.test.ts"
+    "test": "node --test src/lib/*.test.ts",
+    "companion:build": "tsc -p companion/tsconfig.json",
+    "companion:test": "node --test companion/src/*.test.ts",
+    "companion:start:dev": "bash scripts/start-callflow-companion-dev.sh",
+    "companion:stop": "bash scripts/stop-callflow-companion-dev.sh",
+    "companion:check": "bash scripts/check-callflow-companion-dev.sh"
   },
   "dependencies": {
     "@supabase/ssr": "^0.12.1",

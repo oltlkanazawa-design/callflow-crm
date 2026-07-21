@@ -247,6 +247,19 @@ MacBook Air（内蔵マイク）+ Google Chrome（一時プロファイル、既
 
 ---
 
+## 9-2. Phase 2A（Companion最小構成・音声送信テスト）実装結果
+
+実施日: 2026-07-21
+
+Node標準機能（`node:http`/`node:https`/`node:crypto`/`node:fs`/`node:stream`等）のみでCallFlow Companionの最小構成（`GET /v1/health`, `POST /v1/pair`, `POST /v1/audio`）を実装した。新規npm依存関係は追加していない。Homebrew・mkcert・ffmpeg・whisper.cppは今回もインストールしていない（開発用HTTPモードのみで確認）。
+
+- Companionは`127.0.0.1:4318`のみにバインドし、`CALLFLOW_COMPANION_ALLOW_INSECURE_HTTP=true`を明示的に設定しない限り起動しない設計とした（TLS証明書が無い場合は起動を拒否する）。
+- ペアリング（6桁コード・10分失効・1回使用・失敗回数上限）、Bearerトークン発行（ハッシュ化保存、生トークンは非ログ出力）、Origin完全一致のCORS、音声のストリーミング受信・MIME検証・100MBサイズ制限（Content-Length偽装対策込み）、一時ファイルの安全な作成・削除（0700/0600権限、UUIDファイル名、パストラバーサル対策、起動時・終了時清掃）を実装し、companion側46件・ブラウザクライアント側14件の自動テストで検証した。
+- 実機（MacBook Air、Google Chrome、デモモード）で、Companion起動→CallFlowからのhealth check→ペアリング→トークンのlocalStorage保存・再読み込み後の復元→ペアリング解除まで一通り確認した。実マイクがこの検証環境では使用できないため、「Macへ送信テスト」ボタンの実クリックまでは到達できなかったが、CallFlowの実origin（`http://127.0.0.1:3002`）・実トークンを使って`POST /v1/audio`を直接実行し、200 OK・一時ファイル削除済みを確認した。この間、Supabase・Vercel・その他外部ドメインへの通信は0件だった。
+- 詳細は [docs/callflow-companion-phase2a.md](./callflow-companion-phase2a.md) を参照。**Phase 2Aの完了条件を満たし、Phase 2B（ffmpeg+whisper.cpp）へ進める状態である。**
+
+---
+
 ## 10. 技術的リスク
 
 - **whisper.cppの精度・速度が実用に耐えるか未検証**（実機未インストールのため）。実装フェーズでの比較検証が必須。

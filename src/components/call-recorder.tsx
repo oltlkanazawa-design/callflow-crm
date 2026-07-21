@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
-import { Mic, Circle, Play, Download, Trash2, Square, AlertTriangle } from "lucide-react";
+import { Mic, Circle, Play, Download, Trash2, Square, AlertTriangle, Wifi, WifiOff, Send, KeyRound, Unplug } from "lucide-react";
 import {
   transition, canStartTest, canStartRecording, canStopRecording, canChangeMicrophone, isLocked, hasPendingRecording,
   pickSupportedMimeType, formatElapsedTime, formatFileSize, buildRecordingFileName,
@@ -9,6 +9,11 @@ import {
   TEST_RECORDING_MS, RECORDING_TIMESLICE_MS,
   type RecorderState,
 } from "@/lib/call-recorder";
+import {
+  getCompanionBaseUrl, loadStoredToken, storeToken, clearStoredToken,
+  checkCompanionHealth, pairWithCompanion, uploadRecordingToCompanion, generateRecordingId,
+  companionErrorMessage, type CompanionUploadResult,
+} from "@/lib/companion-client";
 
 export interface CallRecorderLockState {
   /** trueの間は録音中（ハードロック。画面遷移・ログアウトを完全に禁止する）。 */
@@ -55,6 +60,15 @@ function isRecorderSupported(): boolean {
   return Boolean(navigator.mediaDevices && window.MediaRecorder);
 }
 
+const CALL_COMPANION_ENABLED = process.env.NEXT_PUBLIC_CALL_COMPANION_ENABLED === "true";
+
+const COMPANION_CONSENT_MESSAGE =
+  "録音音声を、このMac上で動いているCallFlow Companionへ送信します。\n" +
+  "音声はMac内で一時保存され、受信確認後に削除されます。\n" +
+  "SupabaseやVercelには送信されません。";
+
+type CompanionSendState = "idle" | "uploading" | "success" | "error";
+
 const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder({ companyId, onLockChange, notify }, ref) {
   const [state, setState] = useState<RecorderState>(() => (isRecorderSupported() ? "idle" : "unsupported"));
   const [errorCode, setErrorCode] = useState<string | null>(null);
@@ -68,6 +82,22 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   const [mimeType, setMimeType] = useState<string | null>(null);
   const [testUrl, setTestUrl] = useState<string | null>(null);
   const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
+
+  // ---------------------------------------------------------
+  // Companion（Mac上のローカル処理アプリ）連携用の状態
+  // ---------------------------------------------------------
+  const [companionToken, setCompanionToken] = useState<string | null>(() => (CALL_COMPANION_ENABLED ? loadStoredToken() : null));
+  const [companionChecking, setCompanionChecking] = useState(false);
+  const [showPairingForm, setShowPairingForm] = useState(false);
+  const [pairingCodeInput, setPairingCodeInput] = useState("");
+  const [pairingBusy, setPairingBusy] = useState(false);
+  const [pairingError, setPairingError] = useState<string | null>(null);
+  const [sendState, setSendState] = useState<CompanionSendState>("idle");
+  const [sendError, setSendError] = useState<string | null>(null);
+  const [sendResult, setSendResult] = useState<CompanionUploadResult | null>(null);
+
+  const recordingBlobRef = useRef<Blob | null>(null);
+  const sentRecordingKeyRef = useRef<string | null>(null);
 
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -85,6 +115,17 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   useEffect(() => { stateRef.current = state; }, [state]);
 
   const dispatch = (event: Parameters<typeof transition>[1]) => setState((s) => transition(s, event));
+
+  // Companionのペアリング状態はuseStateの初期化関数でlocalStorageから復元する
+  // （マウント時に一度だけ読めばよく、外部システムとの継続的な同期ではないためeffectは使わない）。
+
+  const resetCompanionSendState = useCallback(() => {
+    setSendState("idle");
+    setSendError(null);
+    setSendResult(null);
+    sentRecordingKeyRef.current = null;
+    recordingBlobRef.current = null;
+  }, []);
 
   // ---------------------------------------------------------
   // 音量メーターの停止・AudioContextの解放
@@ -256,6 +297,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     if (!canStartRecording(state)) return;
     setErrorCode(null);
     if (recordingUrl) { URL.revokeObjectURL(recordingUrl); setRecordingUrl(null); }
+    resetCompanionSendState();
     try {
       const stream = await openStream();
       streamRef.current = stream;
@@ -278,6 +320,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
       };
       recorder.onstop = () => {
         const blob = new Blob(chunksRef.current, mimeType ? { type: mimeType } : undefined);
+        recordingBlobRef.current = blob;
         setRecordingUrl(URL.createObjectURL(blob));
         stream.getTracks().forEach((t) => t.stop());
         streamRef.current = null;
@@ -309,6 +352,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     recordingCompanyIdRef.current = null;
     setElapsedMs(0);
     setRecordedBytes(0);
+    resetCompanionSendState();
     dispatch({ type: "DISCARD_RECORDING" });
   };
 
@@ -328,6 +372,84 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   };
 
   // ---------------------------------------------------------
+  // Companion（Mac上のローカル処理アプリ）連携
+  // ---------------------------------------------------------
+  const checkCompanionConnection = async () => {
+    setCompanionChecking(true);
+    try {
+      const health = await checkCompanionHealth(getCompanionBaseUrl());
+      notify(`Companionに接続できました（${health.secure ? "HTTPS" : "開発用HTTP"}・v${health.version}）`);
+    } catch (error) {
+      notify(companionErrorMessage(error));
+    } finally {
+      setCompanionChecking(false);
+    }
+  };
+
+  const submitPairingCode = async () => {
+    if (!/^\d{6}$/.test(pairingCodeInput)) {
+      setPairingError("6桁の数字を入力してください");
+      return;
+    }
+    setPairingBusy(true);
+    setPairingError(null);
+    try {
+      const token = await pairWithCompanion(getCompanionBaseUrl(), pairingCodeInput);
+      storeToken(token);
+      setCompanionToken(token);
+      setShowPairingForm(false);
+      setPairingCodeInput("");
+      notify("Macの処理アプリとペアリングしました");
+    } catch (error) {
+      setPairingError(companionErrorMessage(error));
+    } finally {
+      setPairingBusy(false);
+    }
+  };
+
+  const unpairCompanion = () => {
+    clearStoredToken();
+    setCompanionToken(null);
+    setShowPairingForm(false);
+    notify("Companionとのペアリングを解除しました");
+  };
+
+  const sendRecordingToCompanion = async () => {
+    if (!companionToken || !recordingBlobRef.current) return;
+    if (!isSameCompany(recordingCompanyIdRef.current, companyId)) {
+      notify("表示中の企業が録音時と異なるため、Macへ送信できません");
+      return;
+    }
+    if (sendState === "success" && sentRecordingKeyRef.current === recordingUrl) {
+      const resend = window.confirm("この録音は既にMacへ送信済みです。もう一度送信しますか？");
+      if (!resend) return;
+    }
+    const consent = window.confirm(COMPANION_CONSENT_MESSAGE);
+    if (!consent) return;
+
+    setSendState("uploading");
+    setSendError(null);
+    try {
+      const result = await uploadRecordingToCompanion(getCompanionBaseUrl(), companionToken, recordingBlobRef.current, {
+        recordingId: generateRecordingId(),
+        companyId: companyId ?? null,
+        durationMs: elapsedMs,
+      });
+      setSendResult(result);
+      setSendState("success");
+      sentRecordingKeyRef.current = recordingUrl;
+    } catch (error) {
+      const message = companionErrorMessage(error);
+      setSendError(message);
+      setSendState("error");
+      if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "unauthorized") {
+        clearStoredToken();
+        setCompanionToken(null);
+      }
+    }
+  };
+
+  // ---------------------------------------------------------
   // 企業の取り違え防止：想定外に企業が変わった場合は安全のため強制破棄する
   // ---------------------------------------------------------
   const forceDiscardForSafety = useCallback(() => {
@@ -335,6 +457,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     setRecordingUrl((prev) => { if (prev) URL.revokeObjectURL(prev); return null; });
     recordingCompanyIdRef.current = null;
     setState("ready");
+    resetCompanionSendState();
     notify("表示中の企業が変わったため、安全のため録音を破棄しました");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [notify]);
@@ -381,6 +504,51 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
       <p className="mb-3 text-[10px] leading-5 text-slate-500">
         録音機能は現在テスト中です。録音した音声はブラウザ内だけに保持され、外部には送信されません。
       </p>
+
+      {CALL_COMPANION_ENABLED && (
+        <div className="mb-3 rounded-lg bg-white p-3">
+          {!companionToken ? (
+            <>
+              <p className="mb-2 flex items-center gap-1.5 text-[10px] font-bold text-slate-500">
+                <WifiOff size={12} className="text-slate-400" />Macの処理アプリ：未接続
+              </p>
+              <div className="flex gap-1.5">
+                <button className="btn btn-light flex-1 !py-1.5 text-[10px]" disabled={companionChecking} onClick={checkCompanionConnection}>
+                  {companionChecking ? "確認中…" : "接続を確認"}
+                </button>
+                <button className="btn btn-light flex-1 !py-1.5 text-[10px]" onClick={() => { setShowPairingForm((v) => !v); setPairingError(null); }}>
+                  <KeyRound size={11} className="mr-1 inline" />ペアリングコードを入力
+                </button>
+              </div>
+              {showPairingForm && (
+                <div className="mt-2 flex gap-1.5">
+                  <input
+                    className="input flex-1 text-xs tracking-widest"
+                    inputMode="numeric"
+                    maxLength={6}
+                    placeholder="123456"
+                    value={pairingCodeInput}
+                    onChange={(e) => setPairingCodeInput(e.target.value.replace(/[^0-9]/g, "").slice(0, 6))}
+                  />
+                  <button className="btn btn-primary !py-1.5 text-[10px]" disabled={pairingBusy} onClick={submitPairingCode}>
+                    {pairingBusy ? "確認中…" : "ペアリングする"}
+                  </button>
+                </div>
+              )}
+              {pairingError && <p className="mt-1.5 text-[10px] text-red-600">{pairingError}</p>}
+            </>
+          ) : (
+            <div className="flex items-center justify-between">
+              <p className="flex items-center gap-1.5 text-[10px] font-bold text-emerald-600">
+                <Wifi size={12} />Macの処理アプリ：接続済み
+              </p>
+              <button className="text-[10px] font-bold text-slate-400 underline" onClick={unpairCompanion}>
+                <Unplug size={11} className="mr-1 inline" />ペアリングを解除
+              </button>
+            </div>
+          )}
+        </div>
+      )}
 
       {errorCode && (
         <RecorderNotice tone="error">
@@ -501,6 +669,39 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
               if (window.confirm("録音した音声を破棄します。よろしいですか？")) discardRecording();
             }}><Trash2 size={12} className="mr-1 inline" />破棄</button>
           </div>
+
+          {CALL_COMPANION_ENABLED && companionToken && (
+            <div className="mt-3 border-t border-slate-100 pt-3">
+              {sendState === "idle" && (
+                <button className="btn btn-light w-full text-xs" onClick={sendRecordingToCompanion}>
+                  <Send size={12} className="mr-1 inline" />Macへ送信テスト
+                </button>
+              )}
+              {sendState === "uploading" && (
+                <div className="rounded-lg bg-slate-50 p-3 text-center text-xs font-bold text-slate-600">音声をMacへ送信しています…</div>
+              )}
+              {sendState === "success" && sendResult && (
+                <div className="rounded-lg bg-emerald-50 p-3 text-[10px] leading-5 text-emerald-700">
+                  <p className="font-bold">{sendResult.message}</p>
+                  <p className="mt-1 text-slate-500">
+                    形式 {sendResult.mimeType} ／ {formatFileSize(sendResult.sizeBytes)} ／ {formatElapsedTime(sendResult.durationMs)}
+                    {sendResult.temporaryFileDeleted ? "／ 一時ファイル削除済み" : ""}
+                  </p>
+                  <button className="btn btn-light mt-2 w-full !py-1.5 text-[10px]" onClick={sendRecordingToCompanion}>
+                    もう一度送信する
+                  </button>
+                </div>
+              )}
+              {sendState === "error" && (
+                <div className="rounded-lg bg-red-50 p-3 text-[10px] text-red-600">
+                  <p>{sendError}</p>
+                  <button className="btn btn-light mt-2 w-full !py-1.5 text-[10px]" onClick={sendRecordingToCompanion}>
+                    再送する
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
