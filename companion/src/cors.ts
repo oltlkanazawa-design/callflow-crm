@@ -22,9 +22,17 @@ export function corsHeadersFor(
   };
 }
 
+/**
+ * requestPrivateNetworkは、プリフライトリクエストの
+ * `Access-Control-Request-Private-Network: true` ヘッダーの有無を渡す。
+ * 許可されたOriginの場合に限り `Access-Control-Allow-Private-Network: true` を返す
+ * （Chromeの Private Network Access / Local Network Access 対応。
+ * 未許可Originにはこのヘッダーを絶対に返さない）。
+ */
 export function preflightHeadersFor(
   origin: string | undefined,
   allowedOrigins: readonly string[],
+  requestPrivateNetwork = false,
 ): Record<string, string> | null {
   const base = corsHeadersFor(origin, allowedOrigins);
   if (!base) return null;
@@ -33,5 +41,6 @@ export function preflightHeadersFor(
     "Access-Control-Allow-Methods": ALLOWED_METHODS,
     "Access-Control-Allow-Headers": ALLOWED_HEADERS,
     "Access-Control-Max-Age": String(PREFLIGHT_MAX_AGE_SECONDS),
+    ...(requestPrivateNetwork ? { "Access-Control-Allow-Private-Network": "true" } : {}),
   };
 }

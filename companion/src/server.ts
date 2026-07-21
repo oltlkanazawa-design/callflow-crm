@@ -103,7 +103,8 @@ export function createRequestListener(config: CompanionConfig, pairing: PairingM
     const pathname = url.pathname;
 
     if (req.method === "OPTIONS") {
-      const headers = preflightHeadersFor(origin, config.allowedOrigins);
+      const requestPrivateNetwork = req.headers["access-control-request-private-network"] === "true";
+      const headers = preflightHeadersFor(origin, config.allowedOrigins, requestPrivateNetwork);
       if (!headers) {
         sendNoContent(res, 403);
         return;
@@ -230,15 +231,26 @@ export async function startServer(overrides: Partial<CompanionConfig> = {}): Pro
   const pairing = new PairingManager(config);
   const listener = createRequestListener(config, pairing);
 
-  const server = config.secure
-    ? https.createServer(
+  let server: http.Server | https.Server;
+  if (config.secure) {
+    try {
+      server = https.createServer(
         {
           cert: fs.readFileSync(config.tlsCertPath as string),
           key: fs.readFileSync(config.tlsKeyPath as string),
+          minVersion: "TLSv1.2",
         },
         listener,
-      )
-    : http.createServer(listener);
+      );
+    } catch {
+      // 証明書・秘密鍵が不正な組み合わせの場合。HTTPへは絶対にフォールバックしない。
+      throw new Error(
+        "TLS証明書・秘密鍵の読み込みに失敗しました（不正な組み合わせの可能性があります）。scripts/setup-callflow-companion-tls.sh を再実行してください。",
+      );
+    }
+  } else {
+    server = http.createServer(listener);
+  }
 
   await new Promise<void>((resolve) => {
     server.listen(config.port, config.host, resolve);

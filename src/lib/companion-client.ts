@@ -14,6 +14,71 @@ export function getCompanionBaseUrl(): string {
   return trimmed ? trimmed.replace(/\/+$/, "") : DEFAULT_COMPANION_URL;
 }
 
+export function isInsecureHttpAllowed(): boolean {
+  return process.env.NEXT_PUBLIC_CALLFLOW_COMPANION_ALLOW_INSECURE_HTTP === "true";
+}
+
+// ---------------------------------------------------------
+// Companion URLの検証。localhost系以外への音声送信を防ぐための最終防波堤。
+// ---------------------------------------------------------
+const ALLOWED_HTTPS_HOSTS = ["callflow-companion.localhost", "localhost"];
+const ALLOWED_INSECURE_HTTP_HOSTS = ["127.0.0.1", "localhost"];
+const REQUIRED_PORT = "4318";
+
+export type CompanionUrlInvalidReason =
+  | "invalid_url"
+  | "credentials_not_allowed"
+  | "query_or_fragment_not_allowed"
+  | "port_not_allowed"
+  | "host_not_allowed"
+  | "insecure_http_not_allowed"
+  | "protocol_not_allowed";
+
+export type CompanionUrlValidation = { ok: true } | { ok: false; reason: CompanionUrlInvalidReason };
+
+/**
+ * Companion URLが「localhost系のCompanionだけ」を指しているかを検証する。
+ * 外部ドメイン・LAN IP・任意ポート・認証情報付きURL・query/fragment付きURLを拒否し、
+ * 開発フラグが無い限りhttp URLも拒否する。
+ */
+export function validateCompanionUrl(rawUrl: string, options: { allowInsecureHttp?: boolean } = {}): CompanionUrlValidation {
+  let url: URL;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return { ok: false, reason: "invalid_url" };
+  }
+
+  if (url.username || url.password) {
+    return { ok: false, reason: "credentials_not_allowed" };
+  }
+  if (url.search || url.hash) {
+    return { ok: false, reason: "query_or_fragment_not_allowed" };
+  }
+  if (url.port !== REQUIRED_PORT) {
+    return { ok: false, reason: "port_not_allowed" };
+  }
+
+  if (url.protocol === "https:") {
+    if (!ALLOWED_HTTPS_HOSTS.includes(url.hostname)) {
+      return { ok: false, reason: "host_not_allowed" };
+    }
+    return { ok: true };
+  }
+
+  if (url.protocol === "http:") {
+    if (!options.allowInsecureHttp) {
+      return { ok: false, reason: "insecure_http_not_allowed" };
+    }
+    if (!ALLOWED_INSECURE_HTTP_HOSTS.includes(url.hostname)) {
+      return { ok: false, reason: "host_not_allowed" };
+    }
+    return { ok: true };
+  }
+
+  return { ok: false, reason: "protocol_not_allowed" };
+}
+
 // ---------------------------------------------------------
 // トークン保存（localStorage、SSR安全）
 // ---------------------------------------------------------
@@ -62,6 +127,7 @@ export type CompanionErrorCode =
   | "invalid_request"
   | "not_found"
   | "server_error"
+  | "invalid_companion_url"
   | "unknown";
 
 export class CompanionClientError extends Error {
@@ -92,7 +158,11 @@ const SERVER_ERROR_CODE_MAP: Record<string, CompanionErrorCode> = {
 };
 
 export const COMPANION_ERROR_MESSAGES: Record<CompanionErrorCode, string> = {
-  network_error: "Macの処理アプリ（CallFlow Companion）に接続できませんでした。起動しているか確認してください。",
+  network_error:
+    "Macの処理アプリ（CallFlow Companion）に接続できませんでした。次のいずれかの可能性があります。" +
+    "①Companionが起動していない ②証明書が信頼されていない（scripts/setup-callflow-companion-tls.shを再実行してください） " +
+    "③Chromeでローカルネットワークへのアクセスが許可されていない（アドレスバー左側のサイト設定から許可してください）。" +
+    "npm run companion:check で状態を確認できます。",
   timeout: "Macの処理アプリへの接続がタイムアウトしました。Companionが起動しているか確認してください。",
   unauthorized: "認証が切れています。「ペアリングを解除」してから、もう一度ペアリングしてください。",
   forbidden_origin: "この画面からの接続が許可されていません。",
@@ -106,6 +176,7 @@ export const COMPANION_ERROR_MESSAGES: Record<CompanionErrorCode, string> = {
   invalid_request: "入力内容が正しくありません。",
   not_found: "Companionのエンドポイントが見つかりません。",
   server_error: "Companion内部でエラーが発生しました。",
+  invalid_companion_url: "Companionの接続先設定が正しくありません（localhost系以外への送信は許可されていません）。",
   unknown: "予期しないエラーが発生しました。",
 };
 
@@ -148,6 +219,13 @@ async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: numbe
   }
 }
 
+function assertValidCompanionUrl(baseUrl: string): void {
+  const result = validateCompanionUrl(baseUrl, { allowInsecureHttp: isInsecureHttpAllowed() });
+  if (!result.ok) {
+    throw new CompanionClientError("invalid_companion_url", COMPANION_ERROR_MESSAGES.invalid_companion_url);
+  }
+}
+
 async function parseErrorResponse(res: Response): Promise<CompanionClientError> {
   let serverErrorCode: string | undefined;
   let message: string | undefined;
@@ -174,6 +252,7 @@ export interface CompanionHealth {
 }
 
 export async function checkCompanionHealth(baseUrl: string, options: RequestOptions = {}): Promise<CompanionHealth> {
+  assertValidCompanionUrl(baseUrl);
   const res = await fetchWithTimeout(`${baseUrl}/v1/health`, { method: "GET" }, options.timeoutMs ?? DEFAULT_HEALTH_TIMEOUT_MS, options.signal);
   if (!res.ok) {
     throw await parseErrorResponse(res);
@@ -185,6 +264,7 @@ export async function checkCompanionHealth(baseUrl: string, options: RequestOpti
 // Pairing
 // ---------------------------------------------------------
 export async function pairWithCompanion(baseUrl: string, code: string, options: RequestOptions = {}): Promise<string> {
+  assertValidCompanionUrl(baseUrl);
   const res = await fetchWithTimeout(
     `${baseUrl}/v1/pair`,
     {
@@ -228,6 +308,7 @@ export async function uploadRecordingToCompanion(
   meta: CompanionUploadMeta,
   options: RequestOptions = {},
 ): Promise<CompanionUploadResult> {
+  assertValidCompanionUrl(baseUrl);
   const headers: Record<string, string> = {
     "Content-Type": blob.type || "application/octet-stream",
     Authorization: `Bearer ${token}`,

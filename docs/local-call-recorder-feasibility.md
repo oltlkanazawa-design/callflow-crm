@@ -260,6 +260,23 @@ Node標準機能（`node:http`/`node:https`/`node:crypto`/`node:fs`/`node:stream
 
 ---
 
+## 9-3. Phase 2B（Companion HTTPS化）実装結果
+
+実施日: 2026-07-21
+
+CompanionをHTTPS化し、既定モードをHTTP開発モードからHTTPSへ切り替えた。**この時点でHomebrew・mkcertは実機に未インストール**（ユーザーの判断により実インストールと実機HTTPS確認は後日実施されるため）。そのため、以下は「実機のHomebrew/mkcertインストールに依存しない範囲」での実装・自動テストの結果である。
+
+- `companion/src/config.ts`: `allowInsecureHttp`が明示されない限りHTTPSを既定とし、証明書・秘密鍵の存在・読み取り可否・有効な証明書として解釈できるかを`canStartServer()`で検証。いずれか欠けていてもHTTPへ自動フォールバックせず起動を拒否する。
+- `companion/src/server.ts`: `minVersion: "TLSv1.2"`を明示。証明書・秘密鍵の組み合わせが不正な場合も明確なエラーで起動を拒否する。
+- `companion/src/cors.ts`: Chrome Private Network Access向けに、許可Originかつ`Access-Control-Request-Private-Network: true`の場合のみ`Access-Control-Allow-Private-Network: true`を返す実装を追加。
+- `src/lib/companion-client.ts`: `validateCompanionUrl()`を追加し、Companion接続先が`https://callflow-companion.localhost:4318`等のlocalhost系・ポート4318固定であることを送信前に強制検証する（外部ドメイン・LAN IP・任意ポート・認証情報付きURL・query/fragment付きURLを拒否）。
+- テストはこのセッションの実行時にopensslで自己署名した**テスト専用**の証明書・秘密鍵を使用し、実際のmkcert CAROOT・秘密鍵は一切使用していない。companion側54件（Phase 2Aの46件＋HTTPS/PNA関連8件）・ブラウザクライアント側38件（Phase 2Aの14件＋URL検証関連12件）が全て成功した。
+- Homebrew公式インストーラーをこのセッションのツールから実行しようとしたが、対話的なTTY・sudo資格情報が無いため失敗することを確認した（`sudo -n -v` → `a password is required`）。ユーザーに確認したところ、Homebrew/mkcertの実インストールは後日ご自身で行うとのことで、今回は保留した。
+- そのため、**実際のmkcert発行証明書を使ったChromeでの証明書信頼確認、HTTPS経由の実マイク音声送信、Local Network Access許可の実機確認は未実施**。詳細な残作業は [docs/callflow-companion-phase2b.md](./callflow-companion-phase2b.md) の付録を参照。
+- コード・自動テストの範囲では**Phase 2Bの完了条件を満たしているが、実機確認（Homebrew/mkcertインストール後）が完了するまでPhase 3への移行は保留**とする。
+
+---
+
 ## 10. 技術的リスク
 
 - **whisper.cppの精度・速度が実用に耐えるか未検証**（実機未インストールのため）。実装フェーズでの比較検証が必須。
