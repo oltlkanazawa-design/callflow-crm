@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
-import { Mic, Circle, Play, Download, Trash2, Square, AlertTriangle, Wifi, WifiOff, Send, KeyRound, Unplug, FileText, Copy, X } from "lucide-react";
+import { Mic, Circle, Play, Download, Trash2, Square, AlertTriangle, Wifi, WifiOff, Send, KeyRound, Unplug, FileText, Copy, X, Sparkles, ArrowRightCircle } from "lucide-react";
 import {
   transition, canStartTest, canStartRecording, canStopRecording, canChangeMicrophone, isLocked, hasPendingRecording,
   pickSupportedMimeType, formatElapsedTime, formatFileSize, buildRecordingFileName,
@@ -14,6 +14,7 @@ import {
   checkCompanionHealth, pairWithCompanion, uploadRecordingToCompanion, generateRecordingId,
   companionErrorMessage, type CompanionUploadResult,
   createTranscriptionJob, pollTranscriptionJob, cancelTranscriptionJob, type TranscriptionJobView,
+  createAnalysisJob, pollAnalysisJob, cancelAnalysisJob, type AnalysisJobView, type CallAnalysisResult,
 } from "@/lib/companion-client";
 
 export interface CallRecorderLockState {
@@ -28,10 +29,24 @@ export interface CallRecorderHandle {
   discardRecording: () => void;
 }
 
+/** 「架電フォームへ反映」で親（CallScreen）へ渡す内容。担当者名は自動上書きせず参考情報として扱う。 */
+export interface AppliedAnalysisFields {
+  result: string;
+  heat: string;
+  applyHeat: boolean;
+  summary: string;
+  contactName: string | null;
+  challenges: string[];
+  nextAction: string;
+  nextActionAt: string | null;
+  transcript: string;
+}
+
 interface Props {
   companyId?: string;
   onLockChange: (lock: CallRecorderLockState) => void;
   notify: (message: string) => void;
+  onApplyToForm?: (fields: AppliedAnalysisFields) => void;
 }
 
 type MicSettings = { echoCancellation: boolean; noiseSuppression: boolean; autoGainControl: boolean };
@@ -78,7 +93,26 @@ const TRANSCRIPTION_PROGRESS_MESSAGES: Partial<Record<TranscriptionUiState, stri
   transcribing: "文字起こししています",
 };
 
-const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder({ companyId, onLockChange, notify }, ref) {
+const CALL_ANALYSIS_ENABLED = process.env.NEXT_PUBLIC_CALL_ANALYSIS_ENABLED === "true";
+
+const ANALYSIS_CONSENT_MESSAGE =
+  "文字起こし文章をCodexへ送信し、営業内容を解析します。\n" +
+  "音声ファイルは送信されません。\n" +
+  "解析結果は確認するまで架電記録へ反映されません。";
+
+type AnalysisUiState = "idle" | "checking_auth" | "starting_codex" | "analyzing" | "validating" | "completed" | "failed" | "cancelled";
+
+const ANALYSIS_PROGRESS_MESSAGES: Partial<Record<AnalysisUiState, string>> = {
+  checking_auth: "Codexのログイン状態を確認しています",
+  starting_codex: "解析を開始しています",
+  analyzing: "営業内容を整理しています",
+  validating: "結果を確認しています",
+};
+
+const ANALYSIS_RESULT_OPTIONS = ["アポ獲得", "資料送付", "再架電", "担当者不在", "見込みなし", "その他"] as const;
+const ANALYSIS_HEAT_OPTIONS = ["高", "中", "低"] as const;
+
+const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder({ companyId, onLockChange, notify, onApplyToForm }, ref) {
   const [state, setState] = useState<RecorderState>(() => (isRecorderSupported() ? "idle" : "unsupported"));
   const [errorCode, setErrorCode] = useState<string | null>(null);
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
@@ -116,10 +150,21 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
   const [transcriptionCopied, setTranscriptionCopied] = useState(false);
 
+  // ---------------------------------------------------------
+  // 営業通話解析（Phase 4、Codex連携）用の状態。解析結果はメモリ内のみに保持し、
+  // 「架電フォームへ反映」を押すまでは架電記録に一切影響しない。
+  // ---------------------------------------------------------
+  const [analysisState, setAnalysisState] = useState<AnalysisUiState>("idle");
+  const [analysisResult, setAnalysisResult] = useState<CallAnalysisResult | null>(null);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [analysisApplyHeat, setAnalysisApplyHeat] = useState(false);
+
   const recordingBlobRef = useRef<Blob | null>(null);
   const sentRecordingKeyRef = useRef<string | null>(null);
   const transcriptionJobIdRef = useRef<string | null>(null);
   const transcriptionAbortRef = useRef<AbortController | null>(null);
+  const analysisJobIdRef = useRef<string | null>(null);
+  const analysisAbortRef = useRef<AbortController | null>(null);
 
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -149,6 +194,16 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     recordingBlobRef.current = null;
   }, []);
 
+  const resetAnalysisState = useCallback(() => {
+    analysisAbortRef.current?.abort();
+    analysisAbortRef.current = null;
+    analysisJobIdRef.current = null;
+    setAnalysisState("idle");
+    setAnalysisResult(null);
+    setAnalysisError(null);
+    setAnalysisApplyHeat(false);
+  }, []);
+
   const resetTranscriptionState = useCallback(() => {
     transcriptionAbortRef.current?.abort();
     transcriptionAbortRef.current = null;
@@ -159,7 +214,8 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     setTranscriptionDurationMs(null);
     setTranscriptionError(null);
     setTranscriptionCopied(false);
-  }, []);
+    resetAnalysisState();
+  }, [resetAnalysisState]);
 
   // ---------------------------------------------------------
   // 音量メーターの停止・AudioContextの解放
@@ -502,6 +558,8 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     setTranscriptionError(null);
     setTranscriptionCopied(false);
     setTranscriptionState("uploading");
+    // 文字起こしを取り直す場合、古い文字起こしに基づく解析結果は無効になるため破棄する。
+    resetAnalysisState();
 
     const controller = new AbortController();
     transcriptionAbortRef.current = controller;
@@ -572,6 +630,104 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   };
 
   // ---------------------------------------------------------
+  // 営業通話解析（Phase 4、Codex連携）
+  // ---------------------------------------------------------
+  const startAnalysis = async () => {
+    if (!companionToken || !transcriptionJobIdRef.current || transcriptionState !== "completed") return;
+    if (!isSameCompany(recordingCompanyIdRef.current, companyId)) {
+      notify("表示中の企業が録音・文字起こし時と異なるため、解析できません");
+      return;
+    }
+    if (analysisState !== "idle" && analysisState !== "failed" && analysisState !== "cancelled") return;
+
+    const consent = window.confirm(ANALYSIS_CONSENT_MESSAGE);
+    if (!consent) return;
+
+    setAnalysisResult(null);
+    setAnalysisError(null);
+    setAnalysisApplyHeat(false);
+    setAnalysisState("checking_auth");
+
+    const controller = new AbortController();
+    analysisAbortRef.current = controller;
+
+    try {
+      const jobId = await createAnalysisJob(
+        getCompanionBaseUrl(),
+        companionToken,
+        transcriptionJobIdRef.current,
+        companyId ?? "",
+        { signal: controller.signal },
+      );
+      analysisJobIdRef.current = jobId;
+
+      const finalJob = await pollAnalysisJob(getCompanionBaseUrl(), companionToken, jobId, {
+        signal: controller.signal,
+        onUpdate: (job: AnalysisJobView) => {
+          if (job.status === "queued") { setAnalysisState("checking_auth"); return; }
+          if (job.status === "checking_auth" || job.status === "starting_codex" || job.status === "analyzing" || job.status === "validating") {
+            setAnalysisState(job.status);
+          }
+        },
+      });
+
+      if (finalJob.status === "completed" && finalJob.analysis) {
+        setAnalysisResult(finalJob.analysis);
+        setAnalysisState("completed");
+      } else if (finalJob.status === "cancelled") {
+        setAnalysisState("cancelled");
+      } else {
+        setAnalysisError(finalJob.message ?? "解析に失敗しました。");
+        setAnalysisState("failed");
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      setAnalysisError(companionErrorMessage(error));
+      setAnalysisState("failed");
+    } finally {
+      analysisAbortRef.current = null;
+    }
+  };
+
+  const cancelAnalysis = async () => {
+    const jobId = analysisJobIdRef.current;
+    analysisAbortRef.current?.abort();
+    analysisAbortRef.current = null;
+    setAnalysisState("cancelled");
+    if (companionToken && jobId) {
+      try {
+        await cancelAnalysisJob(getCompanionBaseUrl(), companionToken, jobId);
+      } catch {
+        // キャンセル要求自体が失敗しても、UI側は既にcancelled表示にしているため致命的ではない。
+      }
+    }
+  };
+
+  function updateAnalysisField<K extends keyof CallAnalysisResult>(key: K, value: CallAnalysisResult[K]) {
+    setAnalysisResult((prev) => (prev ? { ...prev, [key]: value } : prev));
+  }
+
+  const applyAnalysisToForm = () => {
+    if (!analysisResult) return;
+    if (!isSameCompany(recordingCompanyIdRef.current, companyId)) {
+      notify("表示中の企業が録音・解析時と異なるため、反映できません");
+      return;
+    }
+    onApplyToForm?.({
+      result: analysisResult.result,
+      heat: analysisResult.heat,
+      applyHeat: analysisApplyHeat,
+      summary: analysisResult.summary,
+      contactName: analysisResult.contact_name,
+      challenges: analysisResult.challenges,
+      nextAction: analysisResult.next_action,
+      nextActionAt: analysisResult.next_action_at,
+      transcript: transcriptionText,
+    });
+    notify("解析結果を架電フォームへ反映しました");
+  };
+
+  // ---------------------------------------------------------
   // 企業の取り違え防止：想定外に企業が変わった場合は安全のため強制破棄する
   // ---------------------------------------------------------
   const forceDiscardForSafety = useCallback(() => {
@@ -609,6 +765,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
       if (testUrl) URL.revokeObjectURL(testUrl);
       if (recordingUrl) URL.revokeObjectURL(recordingUrl);
       transcriptionAbortRef.current?.abort();
+      analysisAbortRef.current?.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -781,7 +938,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
             録音時間 {formatElapsedTime(elapsedMs)} ／ {formatFileSize(recordedBytes)} ／ {mimeType || "既定形式"}
           </p>
           <audio className="w-full" controls src={recordingUrl} />
-          <p className="mt-2 rounded bg-slate-50 p-2 text-[10px] text-slate-500">AI解析・架電結果の自動入力は次のPhaseで追加します</p>
+          <p className="mt-2 rounded bg-slate-50 p-2 text-[10px] text-slate-500">解析結果はご自身で確認・編集してから架電フォームへ反映してください（自動保存はされません）</p>
           <div className="mt-2 grid grid-cols-3 gap-1.5">
             <button className="btn btn-light !py-1.5 text-[10px]" onClick={downloadRecording}><Download size={12} className="mr-1 inline" />保存</button>
             <button className="btn btn-light !py-1.5 text-[10px]" onClick={() => {
@@ -880,6 +1037,134 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
                 <div className="rounded-lg bg-red-50 p-3 text-[10px] text-red-600">
                   <p>{transcriptionError}</p>
                   <button className="btn btn-light mt-2 w-full !py-1.5 text-[10px]" onClick={startTranscription}>
+                    再試行する
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {CALL_ANALYSIS_ENABLED && companionToken && transcriptionState === "completed" && (
+            <div className="mt-3 border-t border-slate-100 pt-3">
+              {analysisState === "idle" && (
+                <button className="btn btn-ai w-full text-xs" onClick={startAnalysis}>
+                  <Sparkles size={12} className="mr-1 inline" />Codexで営業内容を解析
+                </button>
+              )}
+              {(analysisState === "checking_auth" || analysisState === "starting_codex" || analysisState === "analyzing" || analysisState === "validating") && (
+                <div className="rounded-lg bg-slate-50 p-3">
+                  <p className="text-center text-xs font-bold text-slate-600">{ANALYSIS_PROGRESS_MESSAGES[analysisState]}…</p>
+                  <button className="btn btn-light mt-2 w-full !py-1.5 text-[10px]" onClick={cancelAnalysis}>
+                    <X size={11} className="mr-1 inline" />キャンセル
+                  </button>
+                </div>
+              )}
+              {analysisState === "completed" && analysisResult && (
+                <div className="rounded-lg bg-white p-3">
+                  {(analysisResult.needs_review || analysisResult.confidence < 0.6) && (
+                    <p className="mb-2 flex items-start gap-1.5 rounded-lg bg-amber-50 p-2 text-[10px] leading-5 text-amber-700">
+                      <AlertTriangle size={12} className="mt-0.5 shrink-0" />
+                      <span>
+                        内容の確認をおすすめします（解析信頼度 {Math.round(analysisResult.confidence * 100)}%）
+                        {analysisResult.review_reasons.length > 0 && `：${analysisResult.review_reasons.join("／")}`}
+                      </span>
+                    </p>
+                  )}
+                  <div className="grid grid-cols-2 gap-2">
+                    <label className="block">
+                      <span className="mb-1 block text-[9px] font-bold text-slate-500">架電結果</span>
+                      <select
+                        className="input !py-1.5 text-[11px]"
+                        value={analysisResult.result}
+                        onChange={(e) => updateAnalysisField("result", e.target.value)}
+                      >
+                        {ANALYSIS_RESULT_OPTIONS.map((v) => <option key={v} value={v}>{v}</option>)}
+                      </select>
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-[9px] font-bold text-slate-500">温度感</span>
+                      <select
+                        className="input !py-1.5 text-[11px]"
+                        value={analysisResult.heat}
+                        onChange={(e) => updateAnalysisField("heat", e.target.value)}
+                      >
+                        {ANALYSIS_HEAT_OPTIONS.map((v) => <option key={v} value={v}>{v}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                  <label className="mt-2 flex items-center gap-1.5 text-[10px] text-slate-500">
+                    <input type="checkbox" checked={analysisApplyHeat} onChange={(e) => setAnalysisApplyHeat(e.target.checked)} />
+                    この温度感（{analysisResult.heat}）を企業情報に適用する
+                  </label>
+                  <label className="mt-2 block">
+                    <span className="mb-1 block text-[9px] font-bold text-slate-500">要約</span>
+                    <textarea
+                      className="input min-h-[70px] w-full text-[11px] leading-5"
+                      value={analysisResult.summary}
+                      onChange={(e) => updateAnalysisField("summary", e.target.value)}
+                    />
+                  </label>
+                  <label className="mt-2 block">
+                    <span className="mb-1 block text-[9px] font-bold text-slate-500">相手の課題（1行に1つ）</span>
+                    <textarea
+                      className="input min-h-[50px] w-full text-[11px] leading-5"
+                      value={analysisResult.challenges.join("\n")}
+                      onChange={(e) => updateAnalysisField("challenges", e.target.value.split("\n").filter((s) => s.trim()))}
+                    />
+                  </label>
+                  <div className="mt-2 grid grid-cols-2 gap-2">
+                    <label className="block">
+                      <span className="mb-1 block text-[9px] font-bold text-slate-500">検出した担当者（参考、自動保存されません）</span>
+                      <input
+                        className="input !py-1.5 text-[11px]"
+                        value={analysisResult.contact_name ?? ""}
+                        placeholder="検出できず"
+                        onChange={(e) => updateAnalysisField("contact_name", e.target.value || null)}
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="mb-1 block text-[9px] font-bold text-slate-500">次回対応日</span>
+                      <input
+                        type="datetime-local"
+                        className="input !py-1.5 text-[11px]"
+                        value={analysisResult.next_action_at ?? ""}
+                        onChange={(e) => updateAnalysisField("next_action_at", e.target.value || null)}
+                      />
+                    </label>
+                  </div>
+                  <label className="mt-2 block">
+                    <span className="mb-1 block text-[9px] font-bold text-slate-500">次回対応</span>
+                    <textarea
+                      className="input min-h-[50px] w-full text-[11px] leading-5"
+                      value={analysisResult.next_action}
+                      onChange={(e) => updateAnalysisField("next_action", e.target.value)}
+                    />
+                  </label>
+                  <div className="mt-3 grid grid-cols-3 gap-1.5">
+                    <button className="btn btn-primary col-span-1 !py-1.5 text-[10px]" onClick={applyAnalysisToForm}>
+                      <ArrowRightCircle size={12} className="mr-1 inline" />架電フォームへ反映
+                    </button>
+                    <button className="btn btn-light !py-1.5 text-[10px]" onClick={startAnalysis}>
+                      <Sparkles size={12} className="mr-1 inline" />再実行
+                    </button>
+                    <button className="btn btn-light !py-1.5 text-[10px] text-red-600" onClick={resetAnalysisState}>
+                      <Trash2 size={12} className="mr-1 inline" />破棄
+                    </button>
+                  </div>
+                </div>
+              )}
+              {analysisState === "cancelled" && (
+                <div className="rounded-lg bg-slate-50 p-3 text-[10px] text-slate-500">
+                  <p>解析をキャンセルしました。</p>
+                  <button className="btn btn-light mt-2 w-full !py-1.5 text-[10px]" onClick={startAnalysis}>
+                    もう一度実行する
+                  </button>
+                </div>
+              )}
+              {analysisState === "failed" && (
+                <div className="rounded-lg bg-red-50 p-3 text-[10px] text-red-600">
+                  <p>{analysisError}</p>
+                  <button className="btn btn-light mt-2 w-full !py-1.5 text-[10px]" onClick={startAnalysis}>
                     再試行する
                   </button>
                 </div>

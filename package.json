@@ -10,7 +10,7 @@
     "lint": "eslint",
     "test": "node --test src/lib/*.test.ts",
     "companion:build": "tsc -p companion/tsconfig.json",
-    "companion:test": "node --test companion/src/*.test.ts",
+    "companion:test": "node --test --test-concurrency=1 companion/src/*.test.ts",
     "companion:setup-tls": "bash scripts/setup-callflow-companion-tls.sh",
     "companion:start": "bash scripts/start-callflow-companion.sh",
     "companion:stop": "bash scripts/stop-callflow-companion.sh",

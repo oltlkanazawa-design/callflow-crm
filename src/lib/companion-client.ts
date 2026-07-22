@@ -134,6 +134,14 @@ export type CompanionErrorCode =
   | "conversion_timeout"
   | "transcription_failed"
   | "transcription_timeout"
+  | "not_authenticated"
+  | "usage_limit_exceeded"
+  | "codex_unavailable"
+  | "invalid_output"
+  | "transcript_too_long"
+  | "transcription_not_found"
+  | "transcription_not_ready"
+  | "transcription_empty"
   | "internal_error"
   | "unknown";
 
@@ -168,6 +176,17 @@ const SERVER_ERROR_CODE_MAP: Record<string, CompanionErrorCode> = {
   conversion_timeout: "conversion_timeout",
   transcription_failed: "transcription_failed",
   transcription_timeout: "transcription_timeout",
+  not_authenticated: "not_authenticated",
+  usage_limit_exceeded: "usage_limit_exceeded",
+  codex_unavailable: "codex_unavailable",
+  invalid_output: "invalid_output",
+  transcript_too_long: "transcript_too_long",
+  transcription_not_found: "transcription_not_found",
+  transcription_not_ready: "transcription_not_ready",
+  transcription_empty: "transcription_empty",
+  // 解析ジョブ（analysis-jobs.ts）の"timeout"エラーコードも既存のtimeoutへ寄せる
+  // （"cancelled"はエラーというよりjob.statusで表現される状態のため、あえてマッピングしない）。
+  timeout: "timeout",
   internal_error: "internal_error",
 };
 
@@ -197,6 +216,14 @@ export const COMPANION_ERROR_MESSAGES: Record<CompanionErrorCode, string> = {
   conversion_timeout: "音声の変換がタイムアウトしました。",
   transcription_failed: "文字起こし処理に失敗しました。",
   transcription_timeout: "文字起こし処理がタイムアウトしました。",
+  not_authenticated: "Codexへのログインが必要です。ターミナルで codex login を実行してください。",
+  usage_limit_exceeded: "Codexの利用上限に達しています。利用可能になってから再試行してください。",
+  codex_unavailable: "Codexアプリサーバーを起動できませんでした。",
+  invalid_output: "Codexからの応答を解析結果として解釈できませんでした。",
+  transcript_too_long: "文字起こしが長すぎるため解析できません。",
+  transcription_not_found: "参照元の文字起こしジョブが見つかりません。",
+  transcription_not_ready: "参照元の文字起こしがまだ完了していません。",
+  transcription_empty: "参照元の文字起こしが空です。",
   internal_error: "Companion内部でエラーが発生しました。",
   unknown: "予期しないエラーが発生しました。",
 };
@@ -476,6 +503,147 @@ export async function pollTranscriptionJob(
       throw new CompanionClientError("timeout", COMPANION_ERROR_MESSAGES.timeout);
     }
     const job = await getTranscriptionJob(baseUrl, token, jobId, options);
+    options.onUpdate?.(job);
+    if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+      return job;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  }
+}
+
+// ---------------------------------------------------------
+// 営業通話解析ジョブ（Phase 4）
+// ---------------------------------------------------------
+export type AnalysisJobStatus =
+  | "queued"
+  | "checking_auth"
+  | "starting_codex"
+  | "analyzing"
+  | "validating"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface CallAnalysisResult {
+  result: string;
+  heat: string;
+  summary: string;
+  contact_name: string | null;
+  challenges: string[];
+  next_action: string;
+  next_action_at: string | null;
+  confidence: number;
+  needs_review: boolean;
+  review_reasons: string[];
+}
+
+export interface AnalysisJobView {
+  jobId: string;
+  status: AnalysisJobStatus;
+  analysis: CallAnalysisResult | null;
+  error: CompanionErrorCode | null;
+  message: string | null;
+}
+
+const DEFAULT_CREATE_ANALYSIS_TIMEOUT_MS = 8_000;
+const DEFAULT_ANALYSIS_POLL_TIMEOUT_MS = 8_000;
+const DEFAULT_CANCEL_ANALYSIS_TIMEOUT_MS = 8_000;
+
+/**
+ * 完了済みのtranscriptionJobIdを参照して解析ジョブを作成する。文字起こし全文は
+ * 再送しない（Companion内の完了済みジョブをサーバー側が直接参照する）。
+ */
+export async function createAnalysisJob(
+  baseUrl: string,
+  token: string,
+  transcriptionJobId: string,
+  companyId: string,
+  options: RequestOptions = {},
+): Promise<string> {
+  assertValidCompanionUrl(baseUrl);
+  const res = await fetchWithTimeout(
+    `${baseUrl}/v1/analyses`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ transcriptionJobId, companyId }),
+    },
+    options.timeoutMs ?? DEFAULT_CREATE_ANALYSIS_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!res.ok) {
+    throw await parseErrorResponse(res);
+  }
+  const body = (await res.json()) as { ok: true; jobId: string };
+  return body.jobId;
+}
+
+export async function getAnalysisJob(
+  baseUrl: string,
+  token: string,
+  jobId: string,
+  options: RequestOptions = {},
+): Promise<AnalysisJobView> {
+  assertValidCompanionUrl(baseUrl);
+  const res = await fetchWithTimeout(
+    `${baseUrl}/v1/analyses/${encodeURIComponent(jobId)}`,
+    { method: "GET", headers: { Authorization: `Bearer ${token}` } },
+    options.timeoutMs ?? DEFAULT_ANALYSIS_POLL_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!res.ok) {
+    throw await parseErrorResponse(res);
+  }
+  const body = (await res.json()) as {
+    ok: true;
+    jobId: string;
+    status: AnalysisJobStatus;
+    analysis: CallAnalysisResult | null;
+    error: string | null;
+    message: string | null;
+  };
+  return {
+    jobId: body.jobId,
+    status: body.status,
+    analysis: body.analysis,
+    error: body.error ? (SERVER_ERROR_CODE_MAP[body.error] ?? "unknown") : null,
+    message: body.message,
+  };
+}
+
+export async function cancelAnalysisJob(
+  baseUrl: string,
+  token: string,
+  jobId: string,
+  options: RequestOptions = {},
+): Promise<AnalysisJobStatus> {
+  assertValidCompanionUrl(baseUrl);
+  const res = await fetchWithTimeout(
+    `${baseUrl}/v1/analyses/${encodeURIComponent(jobId)}`,
+    { method: "DELETE", headers: { Authorization: `Bearer ${token}` } },
+    options.timeoutMs ?? DEFAULT_CANCEL_ANALYSIS_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!res.ok) {
+    throw await parseErrorResponse(res);
+  }
+  const body = (await res.json()) as { ok: true; status: AnalysisJobStatus };
+  return body.status;
+}
+
+/** ジョブが完了/失敗/キャンセルになるまでポーリングする。 */
+export async function pollAnalysisJob(
+  baseUrl: string,
+  token: string,
+  jobId: string,
+  options: RequestOptions & { intervalMs?: number; onUpdate?: (job: AnalysisJobView) => void } = {},
+): Promise<AnalysisJobView> {
+  const intervalMs = options.intervalMs ?? 1000;
+  for (;;) {
+    if (options.signal?.aborted) {
+      throw new CompanionClientError("timeout", COMPANION_ERROR_MESSAGES.timeout);
+    }
+    const job = await getAnalysisJob(baseUrl, token, jobId, options);
     options.onUpdate?.(job);
     if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
       return job;

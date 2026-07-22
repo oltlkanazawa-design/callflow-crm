@@ -16,6 +16,9 @@ import { receiveAudioUpload } from "./audio-upload.ts";
 import { sendJson, sendNoContent } from "./responses.ts";
 import { TranscriptionJobManager } from "./transcription-jobs.ts";
 import { handleTranscriptionRequest } from "./transcription-routes.ts";
+import { CodexAppServer, loadCodexAppServerConfig } from "./codex-app-server.ts";
+import { AnalysisJobManager, loadAnalysisJobConfig } from "./analysis-jobs.ts";
+import { handleAnalysisRequest } from "./analysis-routes.ts";
 import type {
   AudioUploadFailureReason,
   CompanionConfig,
@@ -27,7 +30,7 @@ import type {
 export const COMPANION_VERSION = "0.1.0";
 const PAIR_BODY_MAX_BYTES = 4096;
 
-function readSmallJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> {
+export function readSmallJsonBody(req: IncomingMessage, maxBytes: number): Promise<unknown> {
   return new Promise((resolve, reject) => {
     let total = 0;
     const chunks: Buffer[] = [];
@@ -98,7 +101,12 @@ function safeRecordingIdFromHeader(value: string | string[] | undefined): string
   return trimmed;
 }
 
-export function createRequestListener(config: CompanionConfig, pairing: PairingManager, jobManager: TranscriptionJobManager) {
+export function createRequestListener(
+  config: CompanionConfig,
+  pairing: PairingManager,
+  jobManager: TranscriptionJobManager,
+  analysisJobManager: AnalysisJobManager,
+) {
   return async function requestListener(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const origin = req.headers.origin;
     const url = new URL(req.url ?? "/", `http://${config.host}:${config.port}`);
@@ -209,7 +217,12 @@ export function createRequestListener(config: CompanionConfig, pairing: PairingM
       return;
     }
 
-    if (pathname === "/v1/transcriptions" || pathname.startsWith("/v1/transcriptions/")) {
+    if (
+      pathname === "/v1/transcriptions" ||
+      pathname.startsWith("/v1/transcriptions/") ||
+      pathname === "/v1/analyses" ||
+      pathname.startsWith("/v1/analyses/")
+    ) {
       // /v1/audioと同様に、トークン検証より前にOriginなし・未許可Originを明示的に拒否する
       // （POSTだけでなくGET/DELETEも含める。Bearerトークンによる認証がありプリフライトでも
       //  実質的に守られてはいるが、多層防御としてエンドポイント全体で一貫させる）。
@@ -227,6 +240,9 @@ export function createRequestListener(config: CompanionConfig, pairing: PairingM
     const handledTranscription = await handleTranscriptionRequest(req, res, pathname, req.method, pairing, jobManager, cors);
     if (handledTranscription) return;
 
+    const handledAnalysis = await handleAnalysisRequest(req, res, pathname, req.method, pairing, analysisJobManager, cors);
+    if (handledAnalysis) return;
+
     sendJson(res, 404, { ok: false, error: "not_found", message: "エンドポイントが見つかりません。" }, cors);
   };
 }
@@ -236,6 +252,8 @@ export interface StartedCompanion {
   config: CompanionConfig;
   pairing: PairingManager;
   jobManager: TranscriptionJobManager;
+  analysisJobManager: AnalysisJobManager;
+  codexAppServer: CodexAppServer;
   close: () => Promise<void>;
 }
 
@@ -251,7 +269,19 @@ export async function startServer(overrides: Partial<CompanionConfig> = {}): Pro
 
   const pairing = new PairingManager(config);
   const jobManager = new TranscriptionJobManager(config);
-  const listener = createRequestListener(config, pairing, jobManager);
+
+  const codexAppServer = new CodexAppServer(loadCodexAppServerConfig());
+  // Codexの作業ディレクトリはリポジトリ外の専用ディレクトリ。起動時に必ず空の状態にする
+  // （個人ファイル・コードを一切含めない。既存のtemp-files.tsのヘルパーをそのまま再利用する）。
+  await ensureTmpDir(codexAppServer.workDir);
+  await cleanupAllTempFiles(codexAppServer.workDir);
+  const analysisJobManager = new AnalysisJobManager(
+    loadAnalysisJobConfig({ workDir: codexAppServer.workDir }),
+    jobManager,
+    codexAppServer,
+  );
+
+  const listener = createRequestListener(config, pairing, jobManager, analysisJobManager);
 
   let server: http.Server | https.Server;
   if (config.secure) {
@@ -279,14 +309,19 @@ export async function startServer(overrides: Partial<CompanionConfig> = {}): Pro
   });
 
   const close = async (): Promise<void> => {
+    // 解析ジョブ・文字起こしジョブを先に終わらせてから、それらが依存するプロセス
+    // （Codex App Server／whisper-cli・ffmpeg）を止める。
+    await analysisJobManager.shutdown();
     await jobManager.shutdown();
+    await codexAppServer.stop();
     await new Promise<void>((resolve, reject) => {
       server.close((err) => (err ? reject(err) : resolve()));
     });
     await cleanupAllTempFiles(config.tmpDir);
+    await cleanupAllTempFiles(codexAppServer.workDir);
   };
 
-  return { server, config, pairing, jobManager, close };
+  return { server, config, pairing, jobManager, analysisJobManager, codexAppServer, close };
 }
 
 function formatLocalTime(ms: number): string {

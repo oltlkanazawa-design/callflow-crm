@@ -308,13 +308,32 @@ Phase 3Aのffmpeg・whisper.cppを、既存のHTTPS版Companion（Phase 2B）へ
 
 ---
 
+## 9-6. Phase 4（Codex App Serverによる営業通話解析）実装結果
+
+実施日: 2026-07-22
+
+文字起こし文章をCodex（`codex app-server`、Companionの子プロセス、ChatGPTアカウント認証・OpenAI APIキー不使用）へ送信して営業内容を解析し、構造化された架電結果・温度感・要約・担当者名・課題・次回対応・次回対応日・信頼度・要確認フラグを提案させる非同期ジョブAPI（`POST/GET/DELETE /v1/analyses`）を実装し、CallFlow側に確認・編集・「架電フォームへ反映」のUIを追加した。解析結果は利用者が明示的に反映を押すまで一切保存されない。
+
+- 実装前に、現在インストール済みのCodex CLI（`codex-cli 0.144.3`）から実際のJSON-RPCプロトコルを再確認（`codex app-server generate-ts`での型生成＋実プロセス起動による生通信確認）。事前資料を鵜呑みにせず、`turn/completed`通知には応答本文が含まれず別途`thread/read`が必要である等の実挙動を実地で発見した
+- プロンプトインジェクション対策（`<transcript>`タグでの分離、`approvalPolicy:"never"`・`sandbox:"read-only"`・ツール/MCP未構成）を、合成のプロンプトインジェクション文言を含む文字起こしを使い、実装コード経由（fakeではなく実際のCodex CLI）で実機検証済み。ファイル読み取り・コマンド実行は一切発生しなかった
+- 独立した設計レビュー（Opus）: REVISE（狭い範囲）。turnタイムアウト未定義（P1）等を実装前に反映
+- 独立したセキュリティレビュー（Opus）: SHIP判定（P0・P1なし）
+- 独立した信頼性レビュー（Opus）: SHIP判定（P0・P1なし）。Codex子プロセスの`stderr`に`'error'`リスナーが無い非対称性、起動タイムアウト時の子プロセス後始末漏れ（いずれもP3）を検出・修正
+- 独立した最終ゲートレビュー（Opus、新規インスタンス）: SHIP判定（P0・P1なし）
+- 詳細は[docs/callflow-analysis-phase4.md](./callflow-analysis-phase4.md)、[docs/callflow-analysis-security.md](./callflow-analysis-security.md)、[docs/callflow-analysis-phase4-review.md](./callflow-analysis-phase4-review.md)を参照
+
+**Phase 4は完了し、実機確認（実際のCodexログイン状態・実際のChatGPTアカウント利用上限状況下での動作確認）へ進める状態である。**
+
+---
+
 ## 10. 技術的リスク
 
 - ~~whisper.cppの精度・速度が実用に耐えるか未検証~~ → **解消（2026-07-22）**。Phase 3Aで実機ベンチマーク済み、詳細は[docs/callflow-transcription-phase3a.md](./callflow-transcription-phase3a.md)参照。
 - ~~Chrome Private Network Accessの実際の挙動が未検証~~ → **解消（2026-07-21〜22）**。Phase 2B実機確認で確認済み。
-- **Codex利用上限**により、構造化出力の正常系動作が今回の調査時点では未確認。Phase 4（Codex App Server統合）着手時に改めて実地確認が必要。
-- **ai_fields列をrecord_call経由で保存するにはDB変更（RPC引数追加）が必要**（§9参照）。Phase 3までのスコープでは対応しない。Phase 4着手時に要検討。
+- ~~Codex利用上限により、構造化出力の正常系動作が未確認~~ → **解消（2026-07-22）**。Phase 4で実際のCodex CLI・ChatGPTアカウントを使い、正常系・プロンプトインジェクション耐性の両方を実機検証済み（詳細は[docs/callflow-analysis-phase4.md](./callflow-analysis-phase4.md) §9参照）。
+- **ai_fields列をrecord_call経由で保存するにはDB変更（RPC引数追加）が必要**（§9参照）。Phase 4までのスコープでは対応しない（DB変更禁止のため）。Phase 5以降で要検討。
 - **60分の長時間録音でのメモリ・処理時間**が実機未検証（Phase 3Bでは60分の上限設定と動的タイムアウトのみ実装、実際の60分音声での実測は未実施）。
+- **Codexの利用上限（レート制限）に達した場合の実際のユーザー体験**は、今回の開発セッションでは利用上限に到達しなかったため未確認（`usage_limit_exceeded`のエラーハンドリング自体は実装・自動テスト済み）。
 
 ---
 
