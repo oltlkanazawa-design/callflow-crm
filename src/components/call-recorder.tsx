@@ -16,6 +16,7 @@ import {
   createTranscriptionJob, pollTranscriptionJob, cancelTranscriptionJob, type TranscriptionJobView,
   createAnalysisJob, pollAnalysisJob, cancelAnalysisJob, type AnalysisJobView, type CallAnalysisResult,
 } from "@/lib/companion-client";
+import { splitAnalysisDateTime, combineDateTime } from "@/lib/analysis-datetime";
 
 export interface CallRecorderLockState {
   /** trueの間は録音中（ハードロック。画面遷移・ログアウトを完全に禁止する）。 */
@@ -158,6 +159,12 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   const [analysisResult, setAnalysisResult] = useState<CallAnalysisResult | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [analysisApplyHeat, setAnalysisApplyHeat] = useState(false);
+  // 次回対応日は日付欄・時刻欄（任意）を独立したstateとして持つ（analysisResult.next_action_atから
+  // 毎回分解し直すと、日付が未入力のまま時刻だけ入力した瞬間にcombineDateTimeがnullを返し、
+  // 次の再描画で入力した時刻が消えてしまうため）。analysisResult.next_action_at自体は
+  // applyAnalysisToFormが読み取る正規値として、変更のたびに同期して更新する。
+  const [analysisNextDate, setAnalysisNextDate] = useState("");
+  const [analysisNextTime, setAnalysisNextTime] = useState("");
 
   const recordingBlobRef = useRef<Blob | null>(null);
   const sentRecordingKeyRef = useRef<string | null>(null);
@@ -202,6 +209,8 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     setAnalysisResult(null);
     setAnalysisError(null);
     setAnalysisApplyHeat(false);
+    setAnalysisNextDate("");
+    setAnalysisNextTime("");
   }, []);
 
   const resetTranscriptionState = useCallback(() => {
@@ -646,6 +655,8 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     setAnalysisResult(null);
     setAnalysisError(null);
     setAnalysisApplyHeat(false);
+    setAnalysisNextDate("");
+    setAnalysisNextTime("");
     setAnalysisState("checking_auth");
 
     const controller = new AbortController();
@@ -673,6 +684,9 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
 
       if (finalJob.status === "completed" && finalJob.analysis) {
         setAnalysisResult(finalJob.analysis);
+        const { date, time } = splitAnalysisDateTime(finalJob.analysis.next_action_at);
+        setAnalysisNextDate(date);
+        setAnalysisNextTime(time);
         setAnalysisState("completed");
       } else if (finalJob.status === "cancelled") {
         setAnalysisState("cancelled");
@@ -1124,12 +1138,29 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
                     </label>
                     <label className="block">
                       <span className="mb-1 block text-[9px] font-bold text-slate-500">次回対応日</span>
-                      <input
-                        type="datetime-local"
-                        className="input !py-1.5 text-[11px]"
-                        value={analysisResult.next_action_at ?? ""}
-                        onChange={(e) => updateAnalysisField("next_action_at", e.target.value || null)}
-                      />
+                      <div className="flex gap-1">
+                        <input
+                          type="date"
+                          className="input !py-1.5 text-[11px]"
+                          value={analysisNextDate}
+                          onChange={(e) => {
+                            const nextDate = e.target.value;
+                            const nextTime = nextDate ? analysisNextTime : "";
+                            setAnalysisNextDate(nextDate);
+                            if (!nextDate) setAnalysisNextTime("");
+                            updateAnalysisField("next_action_at", combineDateTime(nextDate, nextTime));
+                          }}
+                        />
+                        <input
+                          type="time"
+                          className="input !py-1.5 text-[11px]"
+                          value={analysisNextTime}
+                          onChange={(e) => {
+                            setAnalysisNextTime(e.target.value);
+                            updateAnalysisField("next_action_at", combineDateTime(analysisNextDate, e.target.value));
+                          }}
+                        />
+                      </div>
                     </label>
                   </div>
                   <label className="mt-2 block">
