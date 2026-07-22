@@ -1,6 +1,8 @@
 // Origin完全一致によるCORS制御。ワイルドカードは使用しない。
 
-export const ALLOWED_METHODS = "GET, POST, OPTIONS";
+// DELETEはCORSの「simple method」ではないため、/v1/transcriptions/:jobId のキャンセルに
+// プリフライトが必要になる。ここに含めないとブラウザがキャンセルリクエストをブロックする。
+export const ALLOWED_METHODS = "GET, POST, DELETE, OPTIONS";
 export const ALLOWED_HEADERS =
   "Authorization, Content-Type, X-CallFlow-Recording-Id, X-CallFlow-Company-Id, X-CallFlow-Duration-Ms";
 export const PREFLIGHT_MAX_AGE_SECONDS = 600;

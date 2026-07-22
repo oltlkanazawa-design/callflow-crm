@@ -128,6 +128,13 @@ export type CompanionErrorCode =
   | "not_found"
   | "server_error"
   | "invalid_companion_url"
+  | "queue_full"
+  | "audio_too_long"
+  | "conversion_failed"
+  | "conversion_timeout"
+  | "transcription_failed"
+  | "transcription_timeout"
+  | "internal_error"
   | "unknown";
 
 export class CompanionClientError extends Error {
@@ -155,6 +162,13 @@ const SERVER_ERROR_CODE_MAP: Record<string, CompanionErrorCode> = {
   invalid_request: "invalid_request",
   bad_request: "invalid_request",
   not_found: "not_found",
+  queue_full: "queue_full",
+  audio_too_long: "audio_too_long",
+  conversion_failed: "conversion_failed",
+  conversion_timeout: "conversion_timeout",
+  transcription_failed: "transcription_failed",
+  transcription_timeout: "transcription_timeout",
+  internal_error: "internal_error",
 };
 
 export const COMPANION_ERROR_MESSAGES: Record<CompanionErrorCode, string> = {
@@ -177,6 +191,13 @@ export const COMPANION_ERROR_MESSAGES: Record<CompanionErrorCode, string> = {
   not_found: "Companionのエンドポイントが見つかりません。",
   server_error: "Companion内部でエラーが発生しました。",
   invalid_companion_url: "Companionの接続先設定が正しくありません（localhost系以外への送信は許可されていません）。",
+  queue_full: "現在処理中のジョブが多いため、しばらくしてから再度お試しください。",
+  audio_too_long: "音声が60分を超えているため、現在のバージョンでは文字起こしできません。",
+  conversion_failed: "音声の変換に失敗しました。",
+  conversion_timeout: "音声の変換がタイムアウトしました。",
+  transcription_failed: "文字起こし処理に失敗しました。",
+  transcription_timeout: "文字起こし処理がタイムアウトしました。",
+  internal_error: "Companion内部でエラーが発生しました。",
   unknown: "予期しないエラーが発生しました。",
 };
 
@@ -333,4 +354,132 @@ export async function uploadRecordingToCompanion(
 
 export function generateRecordingId(): string {
   return crypto.randomUUID();
+}
+
+// ---------------------------------------------------------
+// 文字起こしジョブ（Phase 3B）
+// ---------------------------------------------------------
+export type TranscriptionJobStatus = "queued" | "converting" | "transcribing" | "completed" | "failed" | "cancelled";
+
+export interface TranscriptionJobView {
+  jobId: string;
+  status: TranscriptionJobStatus;
+  text: string | null;
+  modelUsed: string | null;
+  durationMs: number | null;
+  error: CompanionErrorCode | null;
+  message: string | null;
+  temporaryFilesDeleted: boolean;
+}
+
+const DEFAULT_CREATE_JOB_TIMEOUT_MS = 120_000;
+const DEFAULT_POLL_TIMEOUT_MS = 8_000;
+const DEFAULT_CANCEL_TIMEOUT_MS = 8_000;
+
+/** 音声Blobを送信し、文字起こしジョブを作成する。202と同時にjobIdが返る（結果は別途ポーリングする）。 */
+export async function createTranscriptionJob(
+  baseUrl: string,
+  token: string,
+  blob: Blob,
+  options: RequestOptions = {},
+): Promise<string> {
+  assertValidCompanionUrl(baseUrl);
+  const res = await fetchWithTimeout(
+    `${baseUrl}/v1/transcriptions`,
+    {
+      method: "POST",
+      headers: { "Content-Type": blob.type || "application/octet-stream", Authorization: `Bearer ${token}` },
+      body: blob,
+    },
+    options.timeoutMs ?? DEFAULT_CREATE_JOB_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!res.ok) {
+    throw await parseErrorResponse(res);
+  }
+  const body = (await res.json()) as { ok: true; jobId: string };
+  return body.jobId;
+}
+
+export async function getTranscriptionJob(
+  baseUrl: string,
+  token: string,
+  jobId: string,
+  options: RequestOptions = {},
+): Promise<TranscriptionJobView> {
+  assertValidCompanionUrl(baseUrl);
+  const res = await fetchWithTimeout(
+    `${baseUrl}/v1/transcriptions/${encodeURIComponent(jobId)}`,
+    { method: "GET", headers: { Authorization: `Bearer ${token}` } },
+    options.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!res.ok) {
+    throw await parseErrorResponse(res);
+  }
+  const body = (await res.json()) as {
+    ok: true;
+    jobId: string;
+    status: TranscriptionJobStatus;
+    text: string | null;
+    modelUsed: string | null;
+    durationMs: number | null;
+    error: string | null;
+    message: string | null;
+    temporaryFilesDeleted: boolean;
+  };
+  return {
+    jobId: body.jobId,
+    status: body.status,
+    text: body.text,
+    modelUsed: body.modelUsed,
+    durationMs: body.durationMs,
+    error: body.error ? (SERVER_ERROR_CODE_MAP[body.error] ?? "unknown") : null,
+    message: body.message,
+    temporaryFilesDeleted: body.temporaryFilesDeleted,
+  };
+}
+
+export async function cancelTranscriptionJob(
+  baseUrl: string,
+  token: string,
+  jobId: string,
+  options: RequestOptions = {},
+): Promise<TranscriptionJobStatus> {
+  assertValidCompanionUrl(baseUrl);
+  const res = await fetchWithTimeout(
+    `${baseUrl}/v1/transcriptions/${encodeURIComponent(jobId)}`,
+    { method: "DELETE", headers: { Authorization: `Bearer ${token}` } },
+    options.timeoutMs ?? DEFAULT_CANCEL_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!res.ok) {
+    throw await parseErrorResponse(res);
+  }
+  const body = (await res.json()) as { ok: true; status: TranscriptionJobStatus };
+  return body.status;
+}
+
+/**
+ * ジョブが完了/失敗/キャンセルになるまでポーリングする。
+ * onUpdateが呼ばれるたびに最新状態を通知する（UIの進行表示に使う）。
+ */
+export async function pollTranscriptionJob(
+  baseUrl: string,
+  token: string,
+  jobId: string,
+  options: RequestOptions & { intervalMs?: number; onUpdate?: (job: TranscriptionJobView) => void } = {},
+): Promise<TranscriptionJobView> {
+  const intervalMs = options.intervalMs ?? 1000;
+  for (;;) {
+    if (options.signal?.aborted) {
+      throw new CompanionClientError("timeout", COMPANION_ERROR_MESSAGES.timeout);
+    }
+    const job = await getTranscriptionJob(baseUrl, token, jobId, options);
+    options.onUpdate?.(job);
+    if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
+      return job;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, intervalMs));
+  }
 }

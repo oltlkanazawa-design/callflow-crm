@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState, forwardRef } from "react";
-import { Mic, Circle, Play, Download, Trash2, Square, AlertTriangle, Wifi, WifiOff, Send, KeyRound, Unplug } from "lucide-react";
+import { Mic, Circle, Play, Download, Trash2, Square, AlertTriangle, Wifi, WifiOff, Send, KeyRound, Unplug, FileText, Copy, X } from "lucide-react";
 import {
   transition, canStartTest, canStartRecording, canStopRecording, canChangeMicrophone, isLocked, hasPendingRecording,
   pickSupportedMimeType, formatElapsedTime, formatFileSize, buildRecordingFileName,
@@ -13,6 +13,7 @@ import {
   getCompanionBaseUrl, loadStoredToken, storeToken, clearStoredToken,
   checkCompanionHealth, pairWithCompanion, uploadRecordingToCompanion, generateRecordingId,
   companionErrorMessage, type CompanionUploadResult,
+  createTranscriptionJob, pollTranscriptionJob, cancelTranscriptionJob, type TranscriptionJobView,
 } from "@/lib/companion-client";
 
 export interface CallRecorderLockState {
@@ -69,6 +70,14 @@ const COMPANION_CONSENT_MESSAGE =
 
 type CompanionSendState = "idle" | "uploading" | "success" | "error";
 
+type TranscriptionUiState = "idle" | "uploading" | "converting" | "transcribing" | "completed" | "failed" | "cancelled";
+
+const TRANSCRIPTION_PROGRESS_MESSAGES: Partial<Record<TranscriptionUiState, string>> = {
+  uploading: "音声をMacへ送信しています",
+  converting: "音声を変換しています",
+  transcribing: "文字起こししています",
+};
+
 const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder({ companyId, onLockChange, notify }, ref) {
   const [state, setState] = useState<RecorderState>(() => (isRecorderSupported() ? "idle" : "unsupported"));
   const [errorCode, setErrorCode] = useState<string | null>(null);
@@ -96,8 +105,21 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   const [sendError, setSendError] = useState<string | null>(null);
   const [sendResult, setSendResult] = useState<CompanionUploadResult | null>(null);
 
+  // ---------------------------------------------------------
+  // 文字起こし（Phase 3B）用の状態。文字起こし結果はメモリ内のみに保持し、
+  // localStorage/sessionStorage/IndexedDBへは一切保存しない。
+  // ---------------------------------------------------------
+  const [transcriptionState, setTranscriptionState] = useState<TranscriptionUiState>("idle");
+  const [transcriptionText, setTranscriptionText] = useState("");
+  const [transcriptionModel, setTranscriptionModel] = useState<string | null>(null);
+  const [transcriptionDurationMs, setTranscriptionDurationMs] = useState<number | null>(null);
+  const [transcriptionError, setTranscriptionError] = useState<string | null>(null);
+  const [transcriptionCopied, setTranscriptionCopied] = useState(false);
+
   const recordingBlobRef = useRef<Blob | null>(null);
   const sentRecordingKeyRef = useRef<string | null>(null);
+  const transcriptionJobIdRef = useRef<string | null>(null);
+  const transcriptionAbortRef = useRef<AbortController | null>(null);
 
   const streamRef = useRef<MediaStream | null>(null);
   const recorderRef = useRef<MediaRecorder | null>(null);
@@ -125,6 +147,18 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     setSendResult(null);
     sentRecordingKeyRef.current = null;
     recordingBlobRef.current = null;
+  }, []);
+
+  const resetTranscriptionState = useCallback(() => {
+    transcriptionAbortRef.current?.abort();
+    transcriptionAbortRef.current = null;
+    transcriptionJobIdRef.current = null;
+    setTranscriptionState("idle");
+    setTranscriptionText("");
+    setTranscriptionModel(null);
+    setTranscriptionDurationMs(null);
+    setTranscriptionError(null);
+    setTranscriptionCopied(false);
   }, []);
 
   // ---------------------------------------------------------
@@ -298,6 +332,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     setErrorCode(null);
     if (recordingUrl) { URL.revokeObjectURL(recordingUrl); setRecordingUrl(null); }
     resetCompanionSendState();
+    resetTranscriptionState();
     try {
       const stream = await openStream();
       streamRef.current = stream;
@@ -353,6 +388,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     setElapsedMs(0);
     setRecordedBytes(0);
     resetCompanionSendState();
+    resetTranscriptionState();
     dispatch({ type: "DISCARD_RECORDING" });
   };
 
@@ -449,6 +485,92 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     }
   };
 
+  const startTranscription = async () => {
+    if (!companionToken || !recordingBlobRef.current) return;
+    if (!isSameCompany(recordingCompanyIdRef.current, companyId)) {
+      notify("表示中の企業が録音時と異なるため、文字起こしできません");
+      return;
+    }
+    if (transcriptionState !== "idle" && transcriptionState !== "failed" && transcriptionState !== "cancelled") return;
+
+    const consent = window.confirm(COMPANION_CONSENT_MESSAGE);
+    if (!consent) return;
+
+    setTranscriptionText("");
+    setTranscriptionModel(null);
+    setTranscriptionDurationMs(null);
+    setTranscriptionError(null);
+    setTranscriptionCopied(false);
+    setTranscriptionState("uploading");
+
+    const controller = new AbortController();
+    transcriptionAbortRef.current = controller;
+
+    try {
+      const jobId = await createTranscriptionJob(getCompanionBaseUrl(), companionToken, recordingBlobRef.current, {
+        signal: controller.signal,
+      });
+      transcriptionJobIdRef.current = jobId;
+
+      const finalJob = await pollTranscriptionJob(getCompanionBaseUrl(), companionToken, jobId, {
+        signal: controller.signal,
+        onUpdate: (job: TranscriptionJobView) => {
+          if (job.status === "queued") { setTranscriptionState("uploading"); return; }
+          if (job.status === "converting" || job.status === "transcribing") {
+            setTranscriptionState(job.status);
+          }
+        },
+      });
+
+      if (finalJob.status === "completed") {
+        setTranscriptionText(finalJob.text ?? "");
+        setTranscriptionModel(finalJob.modelUsed);
+        setTranscriptionDurationMs(finalJob.durationMs);
+        setTranscriptionState("completed");
+      } else if (finalJob.status === "cancelled") {
+        setTranscriptionState("cancelled");
+      } else {
+        setTranscriptionError(finalJob.message ?? "文字起こしに失敗しました。");
+        setTranscriptionState("failed");
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      const message = companionErrorMessage(error);
+      setTranscriptionError(message);
+      setTranscriptionState("failed");
+      if (error && typeof error === "object" && "code" in error && (error as { code?: string }).code === "unauthorized") {
+        clearStoredToken();
+        setCompanionToken(null);
+      }
+    } finally {
+      transcriptionAbortRef.current = null;
+    }
+  };
+
+  const cancelTranscription = async () => {
+    const jobId = transcriptionJobIdRef.current;
+    transcriptionAbortRef.current?.abort();
+    transcriptionAbortRef.current = null;
+    setTranscriptionState("cancelled");
+    if (companionToken && jobId) {
+      try {
+        await cancelTranscriptionJob(getCompanionBaseUrl(), companionToken, jobId);
+      } catch {
+        // キャンセル要求自体が失敗しても、UI側は既にcancelled表示にしているため致命的ではない。
+      }
+    }
+  };
+
+  const copyTranscriptionText = async () => {
+    try {
+      await navigator.clipboard.writeText(transcriptionText);
+      setTranscriptionCopied(true);
+      setTimeout(() => setTranscriptionCopied(false), 2000);
+    } catch {
+      notify("コピーに失敗しました。手動で選択してコピーしてください。");
+    }
+  };
+
   // ---------------------------------------------------------
   // 企業の取り違え防止：想定外に企業が変わった場合は安全のため強制破棄する
   // ---------------------------------------------------------
@@ -458,6 +580,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     recordingCompanyIdRef.current = null;
     setState("ready");
     resetCompanionSendState();
+    resetTranscriptionState();
     notify("表示中の企業が変わったため、安全のため録音を破棄しました");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [notify]);
@@ -485,6 +608,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
       stopEverything();
       if (testUrl) URL.revokeObjectURL(testUrl);
       if (recordingUrl) URL.revokeObjectURL(recordingUrl);
+      transcriptionAbortRef.current?.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -657,7 +781,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
             録音時間 {formatElapsedTime(elapsedMs)} ／ {formatFileSize(recordedBytes)} ／ {mimeType || "既定形式"}
           </p>
           <audio className="w-full" controls src={recordingUrl} />
-          <p className="mt-2 rounded bg-slate-50 p-2 text-[10px] text-slate-500">文字起こし・解析は次のPhaseで追加します</p>
+          <p className="mt-2 rounded bg-slate-50 p-2 text-[10px] text-slate-500">AI解析・架電結果の自動入力は次のPhaseで追加します</p>
           <div className="mt-2 grid grid-cols-3 gap-1.5">
             <button className="btn btn-light !py-1.5 text-[10px]" onClick={downloadRecording}><Download size={12} className="mr-1 inline" />保存</button>
             <button className="btn btn-light !py-1.5 text-[10px]" onClick={() => {
@@ -697,6 +821,66 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
                   <p>{sendError}</p>
                   <button className="btn btn-light mt-2 w-full !py-1.5 text-[10px]" onClick={sendRecordingToCompanion}>
                     再送する
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
+
+          {CALL_COMPANION_ENABLED && companionToken && (
+            <div className="mt-3 border-t border-slate-100 pt-3">
+              {transcriptionState === "idle" && (
+                <button className="btn btn-light w-full text-xs" onClick={startTranscription}>
+                  <FileText size={12} className="mr-1 inline" />文字起こしを開始
+                </button>
+              )}
+              {(transcriptionState === "uploading" || transcriptionState === "converting" || transcriptionState === "transcribing") && (
+                <div className="rounded-lg bg-slate-50 p-3">
+                  <p className="text-center text-xs font-bold text-slate-600">
+                    {TRANSCRIPTION_PROGRESS_MESSAGES[transcriptionState]}…
+                  </p>
+                  <button className="btn btn-light mt-2 w-full !py-1.5 text-[10px]" onClick={cancelTranscription}>
+                    <X size={11} className="mr-1 inline" />キャンセル
+                  </button>
+                </div>
+              )}
+              {transcriptionState === "completed" && (
+                <div className="rounded-lg bg-white p-3">
+                  <p className="mb-1.5 text-[10px] text-slate-500">
+                    認識モデル: {transcriptionModel ?? "不明"}
+                    {transcriptionDurationMs !== null && ` ／ 音声長 ${formatElapsedTime(transcriptionDurationMs)}`}
+                  </p>
+                  <textarea
+                    className="input min-h-[100px] w-full text-xs leading-5"
+                    value={transcriptionText}
+                    onChange={(e) => setTranscriptionText(e.target.value)}
+                  />
+                  <div className="mt-2 grid grid-cols-3 gap-1.5">
+                    <button className="btn btn-light !py-1.5 text-[10px]" onClick={copyTranscriptionText}>
+                      <Copy size={12} className="mr-1 inline" />{transcriptionCopied ? "コピー済み" : "コピー"}
+                    </button>
+                    <button className="btn btn-light !py-1.5 text-[10px]" onClick={startTranscription}>
+                      <FileText size={12} className="mr-1 inline" />再実行
+                    </button>
+                    <button className="btn btn-light !py-1.5 text-[10px] text-red-600" onClick={resetTranscriptionState}>
+                      <Trash2 size={12} className="mr-1 inline" />破棄
+                    </button>
+                  </div>
+                </div>
+              )}
+              {transcriptionState === "cancelled" && (
+                <div className="rounded-lg bg-slate-50 p-3 text-[10px] text-slate-500">
+                  <p>文字起こしをキャンセルしました。</p>
+                  <button className="btn btn-light mt-2 w-full !py-1.5 text-[10px]" onClick={startTranscription}>
+                    もう一度実行する
+                  </button>
+                </div>
+              )}
+              {transcriptionState === "failed" && (
+                <div className="rounded-lg bg-red-50 p-3 text-[10px] text-red-600">
+                  <p>{transcriptionError}</p>
+                  <button className="btn btn-light mt-2 w-full !py-1.5 text-[10px]" onClick={startTranscription}>
+                    再試行する
                   </button>
                 </div>
               )}

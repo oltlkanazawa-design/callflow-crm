@@ -14,6 +14,8 @@ import { isAuthorized } from "./auth.ts";
 import { corsHeadersFor, preflightHeadersFor, isOriginAllowed } from "./cors.ts";
 import { receiveAudioUpload } from "./audio-upload.ts";
 import { sendJson, sendNoContent } from "./responses.ts";
+import { TranscriptionJobManager } from "./transcription-jobs.ts";
+import { handleTranscriptionRequest } from "./transcription-routes.ts";
 import type {
   AudioUploadFailureReason,
   CompanionConfig,
@@ -96,7 +98,7 @@ function safeRecordingIdFromHeader(value: string | string[] | undefined): string
   return trimmed;
 }
 
-export function createRequestListener(config: CompanionConfig, pairing: PairingManager) {
+export function createRequestListener(config: CompanionConfig, pairing: PairingManager, jobManager: TranscriptionJobManager) {
   return async function requestListener(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const origin = req.headers.origin;
     const url = new URL(req.url ?? "/", `http://${config.host}:${config.port}`);
@@ -207,6 +209,24 @@ export function createRequestListener(config: CompanionConfig, pairing: PairingM
       return;
     }
 
+    if (pathname === "/v1/transcriptions" || pathname.startsWith("/v1/transcriptions/")) {
+      // /v1/audioと同様に、トークン検証より前にOriginなし・未許可Originを明示的に拒否する
+      // （POSTだけでなくGET/DELETEも含める。Bearerトークンによる認証がありプリフライトでも
+      //  実質的に守られてはいるが、多層防御としてエンドポイント全体で一貫させる）。
+      if (!isOriginAllowed(origin, config.allowedOrigins)) {
+        sendJson(
+          res,
+          AUDIO_FAILURE_STATUS.forbidden_origin,
+          { ok: false, error: "forbidden_origin", message: AUDIO_FAILURE_MESSAGES.forbidden_origin },
+          {},
+        );
+        return;
+      }
+    }
+
+    const handledTranscription = await handleTranscriptionRequest(req, res, pathname, req.method, pairing, jobManager, cors);
+    if (handledTranscription) return;
+
     sendJson(res, 404, { ok: false, error: "not_found", message: "エンドポイントが見つかりません。" }, cors);
   };
 }
@@ -215,6 +235,7 @@ export interface StartedCompanion {
   server: http.Server | https.Server;
   config: CompanionConfig;
   pairing: PairingManager;
+  jobManager: TranscriptionJobManager;
   close: () => Promise<void>;
 }
 
@@ -229,7 +250,8 @@ export async function startServer(overrides: Partial<CompanionConfig> = {}): Pro
   await cleanupAllTempFiles(config.tmpDir);
 
   const pairing = new PairingManager(config);
-  const listener = createRequestListener(config, pairing);
+  const jobManager = new TranscriptionJobManager(config);
+  const listener = createRequestListener(config, pairing, jobManager);
 
   let server: http.Server | https.Server;
   if (config.secure) {
@@ -257,13 +279,14 @@ export async function startServer(overrides: Partial<CompanionConfig> = {}): Pro
   });
 
   const close = async (): Promise<void> => {
+    await jobManager.shutdown();
     await new Promise<void>((resolve, reject) => {
       server.close((err) => (err ? reject(err) : resolve()));
     });
     await cleanupAllTempFiles(config.tmpDir);
   };
 
-  return { server, config, pairing, close };
+  return { server, config, pairing, jobManager, close };
 }
 
 function formatLocalTime(ms: number): string {

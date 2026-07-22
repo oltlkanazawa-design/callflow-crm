@@ -285,13 +285,36 @@ CompanionをHTTPS化し、既定モードをHTTP開発モードからHTTPSへ切
 
 ---
 
+## 9-4. Phase 3A（ffmpeg・whisper.cppセットアップ・モデル選定）実装結果
+
+実施日: 2026-07-22
+
+Homebrewでffmpeg・whisper-cpp（whisper.cpp、`whisper-cli`コマンド）を導入し、公式配布元（HuggingFace `ggerganov/whisper.cpp`）からSHA-256検証付きで`ggml-base.bin`・`ggml-small.bin`（いずれも多言語モデル、`.en`限定版・medium/large版は対象外）を取得した。macOS標準`say`コマンドで生成した日本語音声を使い、base/smallモデルを実機ベンチマークし、精度・速度の両面から`small`をデフォルトモデルに選定した（詳細・実測値は[docs/callflow-transcription-phase3a.md](./callflow-transcription-phase3a.md)参照）。
+
+**whisper.cppの精度・速度は実機で検証済み**（上記「技術的リスク」の1項目目が解消）。独立したセキュリティ・信頼性レビュー（Opus）を経て、指摘事項（Pythonへのコード注入パターン、モデルダウンロードのタイムアウト欠如、`/usr/bin/time`ラップ時のプロセス孤児化バグ等）を修正し、`chore: prepare local whisper transcription`としてコミット済み。
+
+## 9-5. Phase 3B（Companion統合・CallFlow UI）実装結果
+
+実施日: 2026-07-22
+
+Phase 3Aのffmpeg・whisper.cppを、既存のHTTPS版Companion（Phase 2B）へ非同期ジョブAPI（`POST/GET/DELETE /v1/transcriptions`）として統合し、CallFlow側に開始・キャンセル・再試行・コピー・破棄のUIを追加した。文字起こし結果はメモリ上のみで保持し、Supabaseへの保存・Codexによる解析は行わない（Phase 4で対応予定）。
+
+- 実バイナリ・実HTTPS・procedurally生成した合成音声を使った手動E2E（ブラウザ→HTTPS Companion→whisper-cli実行）で、ジョブ作成・完了・一時ファイル完全削除・外部通信ゼロを確認済み
+- 独立したセキュリティレビュー（Opus）: SHIP判定（P0・P1なし）。同時アップロードによる待機上限の実質的な回避（P2）等、軽微な指摘を修正
+- 独立した信頼性レビュー（Opus）: 当初BLOCK判定。ジョブキャンセルとプロセス自然完了が競合した際にタイマーリークでCompanionプロセスが終了できなくなる不具合（P1）、fs操作の例外がCompanionプロセス全体をクラッシュさせうる不具合（P1）を検出。両方修正し、再検証で解消を確認（テストスイートの実行時間が約10分のハングから約3秒へ改善）
+- 詳細は[docs/callflow-transcription-phase3b.md](./callflow-transcription-phase3b.md)、[docs/callflow-transcription-security.md](./callflow-transcription-security.md)、[docs/callflow-transcription-phase3-review.md](./callflow-transcription-phase3-review.md)を参照
+
+**Phase 3（3A・3B）は完了し、Phase 4（Codex App Serverによる解析）へ進める状態である。**
+
+---
+
 ## 10. 技術的リスク
 
-- **whisper.cppの精度・速度が実用に耐えるか未検証**（実機未インストールのため）。実装フェーズでの比較検証が必須。
-- **Chrome Private Network Accessの実際の挙動が未検証**。ドキュメント調査に基づく判断であり、Chromeバージョン依存の可能性がある。
-- **Codex利用上限**により、構造化出力の正常系動作が今回の調査時点では未確認。実装完了後、利用上限回復後（エラーメッセージ上は2026年7月25日16:20以降）に改めて実地確認が必要。
-- **ai_fields列をrecord_call経由で保存するにはDB変更（RPC引数追加）が必要**（§9参照）。今回のスコープでは対応しない。
-- **60分の長時間録音でのメモリ・処理時間**が実機未検証。
+- ~~whisper.cppの精度・速度が実用に耐えるか未検証~~ → **解消（2026-07-22）**。Phase 3Aで実機ベンチマーク済み、詳細は[docs/callflow-transcription-phase3a.md](./callflow-transcription-phase3a.md)参照。
+- ~~Chrome Private Network Accessの実際の挙動が未検証~~ → **解消（2026-07-21〜22）**。Phase 2B実機確認で確認済み。
+- **Codex利用上限**により、構造化出力の正常系動作が今回の調査時点では未確認。Phase 4（Codex App Server統合）着手時に改めて実地確認が必要。
+- **ai_fields列をrecord_call経由で保存するにはDB変更（RPC引数追加）が必要**（§9参照）。Phase 3までのスコープでは対応しない。Phase 4着手時に要検討。
+- **60分の長時間録音でのメモリ・処理時間**が実機未検証（Phase 3Bでは60分の上限設定と動的タイムアウトのみ実装、実際の60分音声での実測は未実施）。
 
 ---
 
