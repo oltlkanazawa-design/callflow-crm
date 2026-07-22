@@ -79,3 +79,36 @@ P0は無し。指摘はすべて実装時に反映済み（turnタイムアウ�
 
 - 自動テストスイートの間欠的なタイミング起因の失敗（このマシン上の無関係な高負荷が原因、コード欠陥ではないと両レビュアーが確認済み）。コミット前に実際のクリーンな実行結果を得ることで対応した
 - `ai_fields`（jsonb列）への構造化データ保存は、DB変更禁止の制約により今回は未対応（意図的、文書化済み）
+
+---
+
+## 7. 追加修正: 次回対応日反映バグ（2026-07-23）
+
+実機確認で発見された「日付は分かるが時刻の言及が無い場合、次回対応日欄が反映されない」不具合の修正（`companion/src/analysis-prompt.ts`・`src/lib/analysis-datetime.ts`（新規）・`src/components/call-recorder.tsx`・`src/components/callflow-app.tsx`）に対し、同一の独立したOpusサブエージェント（Opus 4.8、`Agent(subagent_type: general-purpose, model: "opus")`）へ2回に分けてレビューを依頼した。
+
+### 1回目のレビュー
+
+**判定: REVISE**
+
+検出事項:
+- **P1×1**: 日付未入力の状態で時刻欄だけを入力すると、入力した時刻が即座に破棄される。日付・時刻を単一の`next_action_at`文字列から毎回分解し直す設計だったため、日付が空の状態では`combineDateTime`が`null`を返し、次の再描画で時刻inputの表示も巻き戻ってしまうことが原因。手動での次回対応日入力・解析結果レビュー画面の両方に影響する、本修正で新規に混入した回帰と判定
+- P2×1: `companion/src/analysis-schema.ts`側の「日付のみ文字列を許容する」新しい挙動に対する自動テストが存在しない
+- P3×2: 実在しない暦日（2026-02-30等）の直接テストが無い、`<input type="time">`のplaceholder属性が実質機能しない
+
+### 修正対応
+
+- `src/components/callflow-app.tsx`・`src/components/call-recorder.tsx`: 日付・時刻を単一の結合済み文字列から毎回分解する設計をやめ、日付欄・時刻欄をそれぞれ独立したstateとして保持する設計に変更。保存・反映時にのみ結合するようにした
+- P2に対応し、新規`companion/src/analysis-schema.test.ts`（6件）を追加
+- P3の`<input type="time">`のplaceholder属性を削除
+
+### 2回目のレビュー
+
+**判定: SHIP**（P0・P1なし）
+
+1回目のP1バグが実際のデータフローの追跡により解消していることを確認。新たにP2×1（日付欄をクリアした際、時刻欄の表示が連動してクリアされない場合がある）を検出したが、実害は限定的（保存・反映される値自体は正しくnull/undefinedになる）と判断され、コミットをブロックするレベルではないとされた。この点も追加修正でコミット前に対応済み。
+
+企業ID整合性チェック（`isSameCompany`）・プロンプトインジェクション対策（`analysis-prompt.ts`のBASE_INSTRUCTIONS）への悪影響が無いことも、いずれの回でも独立に再確認された。
+
+再実行結果: `node --test src/lib/analysis-datetime.test.ts`＝13/13、`npm test`＝142/142、`npm run companion:test`＝120/120（新規6件含む）、`npm run lint`＝0エラー、`npx tsc --noEmit`＝エラーなし、`npm run build`（フラグ有効/無効）両方成功、`git diff --check`＝クリーン。
+
+コミット: `4c37221 fix: apply analyzed follow-up date correctly`（ローカルのみ、push・PR・main反映なし）。

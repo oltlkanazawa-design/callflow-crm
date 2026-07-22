@@ -324,6 +324,8 @@ Phase 3Aのffmpeg・whisper.cppを、既存のHTTPS版Companion（Phase 2B）へ
 
 **Phase 4は完了し、実機確認（実際のCodexログイン状態・実際のChatGPTアカウント利用上限状況下での動作確認）へ進める状態である。**
 
+**追記（2026-07-23）**: 実機確認で見つかった「次回対応日が日付のみ（時刻の言及が無い）場合に反映されない」不具合を修正した。次回対応日は日付のみ・日付＋時刻のいずれも安全に扱えるようになり、発言に無い時刻を補完することはない。独立したOpusレビュー（2回、SHIP判定）・実機での表示確認を経てローカルコミット済み。詳細は[docs/callflow-analysis-phase4.md](./callflow-analysis-phase4.md) §10、[docs/callflow-analysis-phase4-review.md](./callflow-analysis-phase4-review.md) §7を参照。
+
 ---
 
 ## 10. 技術的リスク
