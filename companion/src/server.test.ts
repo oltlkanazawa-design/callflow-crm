@@ -385,8 +385,19 @@ test("終了時: closeを呼ぶとtmpDir内の残存ファイルも清掃され�
 test("起動失敗: allowInsecureHttpが無くTLS証明書も無い場合は起動しない", async () => {
   const tmpDir = await makeTmpDir();
   try {
+    // tlsCertPath/tlsKeyPathを明示的に「存在しないパス」に固定する。
+    // 省略するとloadConfig()の既定パス（実ホームディレクトリ配下）を見に行ってしまい、
+    // このマシンで実際にmkcert証明書をセットアップ済みだとテストが偽陽性で失敗するため。
     await assert.rejects(
-      () => startServer({ port: 0, tmpDir, allowInsecureHttp: false, secure: false }),
+      () =>
+        startServer({
+          port: 0,
+          tmpDir,
+          allowInsecureHttp: false,
+          secure: false,
+          tlsCertPath: path.join(tmpDir, "does-not-exist-cert.pem"),
+          tlsKeyPath: path.join(tmpDir, "does-not-exist-key.pem"),
+        }),
       /TLS証明書|安全でないHTTPモード/,
     );
   } finally {
