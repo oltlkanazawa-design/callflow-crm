@@ -22,12 +22,87 @@ const DEV_ORIGINS = [
   "http://127.0.0.1:3002",
 ] as const;
 
+export type ExtraOriginsResult = { ok: true; origins: string[] } | { ok: false; reason: string };
+
+/**
+ * CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINS環境変数（カンマ区切り）を検証・解析する。
+ * Vercel PreviewなどからローカルCompanionへ安全に接続確認するための、追加の許可Origin。
+ * 1件でも不正な値が含まれる場合は黙って無視せず、呼び出し側で起動を拒否できるようエラーを返す。
+ * 値そのものはエラーメッセージ・ログに含めない。
+ */
+export function parseExtraAllowedOrigins(raw: string | undefined): ExtraOriginsResult {
+  if (raw === undefined || raw.trim() === "") return { ok: true, origins: [] };
+
+  const parts = raw.split(",").map((part) => part.trim());
+  const origins: string[] = [];
+
+  for (const part of parts) {
+    if (part === "") {
+      return { ok: false, reason: "CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSに空の項目が含まれています。" };
+    }
+    if (part.includes("*")) {
+      return { ok: false, reason: "CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSにワイルドカードは使用できません。" };
+    }
+
+    let parsed: URL;
+    try {
+      parsed = new URL(part);
+    } catch {
+      return { ok: false, reason: "CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSに不正なURLが含まれています。" };
+    }
+
+    if (parsed.protocol !== "https:") {
+      return { ok: false, reason: "CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSはhttpsのURLのみ許可されます。" };
+    }
+    if (parsed.username !== "" || parsed.password !== "") {
+      return { ok: false, reason: "CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSにユーザー名・パスワードを含めることはできません。" };
+    }
+    if (parsed.search !== "" || parsed.hash !== "") {
+      return { ok: false, reason: "CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSにquery・fragmentを含めることはできません。" };
+    }
+    if (parsed.pathname !== "" && parsed.pathname !== "/") {
+      return { ok: false, reason: "CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSのパスは空または\"/\"のみ許可されます。" };
+    }
+
+    const canonical = parsed.origin;
+    if (canonical === "null") {
+      return { ok: false, reason: "CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSに不正な値が含まれています。" };
+    }
+    if (!origins.includes(canonical)) origins.push(canonical);
+  }
+
+  return { ok: true, origins };
+}
+
 function readIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
   if (!raw) return fallback;
   const parsed = Number.parseInt(raw, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
   return parsed;
+}
+
+/**
+ * 許可Originの一覧を組み立てる。
+ * secureでない場合（開発用の安全でないHTTPモード）は、CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSを
+ * 一切参照しない＝開発モードの許可範囲を広げない。secureな既定モードでのみ、検証済みの
+ * 追加Originをproduction Originの後ろへ（重複除去のうえ）追記する。
+ * 不正な値が1件でも含まれる場合は、黙って無視せず起動そのものを拒否する（呼び出し元へthrowする）。
+ */
+function resolveAllowedOrigins(secure: boolean): string[] {
+  const base = secure ? [...DEV_ORIGINS, PRODUCTION_ORIGIN] : [...DEV_ORIGINS];
+  if (!secure) return base;
+
+  const extra = parseExtraAllowedOrigins(process.env.CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINS);
+  if (!extra.ok) {
+    throw new Error(extra.reason);
+  }
+
+  const merged = [...base];
+  for (const origin of extra.origins) {
+    if (!merged.includes(origin)) merged.push(origin);
+  }
+  return merged;
 }
 
 export function defaultTmpDir(): string {
@@ -66,8 +141,7 @@ export function loadConfig(overrides: Partial<CompanionConfig> = {}): CompanionC
   // それ以外は「安全でないHTTPモードが明示されていない限りHTTPSを既定とする」。
   const secure = overrides.secure ?? !allowInsecureHttp;
 
-  const allowedOrigins =
-    overrides.allowedOrigins ?? (secure ? [...DEV_ORIGINS, PRODUCTION_ORIGIN] : [...DEV_ORIGINS]);
+  const allowedOrigins = overrides.allowedOrigins ?? resolveAllowedOrigins(secure);
 
   return {
     host: "127.0.0.1",

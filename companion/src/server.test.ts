@@ -12,6 +12,16 @@ import type { CompanionConfig } from "./types.ts";
 const ALLOWED_ORIGIN = "http://localhost:3002";
 const PRODUCTION_ORIGIN = "https://callflow-crm-blue.vercel.app";
 const DISALLOWED_ORIGIN = "https://evil.example.com";
+const PREVIEW_ORIGIN = "https://callflow-crm-git-feature-preview-example.vercel.app";
+
+function withExtraAllowedOriginEnv<T>(value: string, fn: () => Promise<T>): Promise<T> {
+  const prev = process.env.CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINS;
+  process.env.CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINS = value;
+  return fn().finally(() => {
+    if (prev === undefined) delete process.env.CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINS;
+    else process.env.CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINS = prev;
+  });
+}
 
 async function makeTmpDir(): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), "callflow-companion-server-test-"));
@@ -608,6 +618,129 @@ test("PNA: 未許可originにはAccess-Control-Allow-Private-Networkを返さな
     } finally {
       await started.close();
     }
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(certDir, { recursive: true, force: true });
+  }
+});
+
+test("HTTPS CORS: CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSで追加したOriginがhealth/pair/audio/transcriptions/analysesすべてで許可される", async () => {
+  const tmpDir = await makeTmpDir();
+  const certDir = await makeTmpDir();
+  try {
+    const { certPath, keyPath, certPem } = generateTestCertificate(certDir);
+    await withExtraAllowedOriginEnv(PREVIEW_ORIGIN, async () => {
+      const started = await startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath });
+      try {
+        assert.ok(started.config.allowedOrigins.includes(PREVIEW_ORIGIN));
+        // 既存のDEV_ORIGINS・PRODUCTION_ORIGINは維持されたままである
+        assert.ok(started.config.allowedOrigins.includes(PRODUCTION_ORIGIN));
+        assert.ok(started.config.allowedOrigins.includes(ALLOWED_ORIGIN));
+
+        const address = started.server.address();
+        const port = typeof address === "object" && address ? address.port : 0;
+
+        for (const path of ["/v1/health", "/v1/pair", "/v1/audio", "/v1/transcriptions", "/v1/analyses"]) {
+          const res = await httpsRequestJson(`https://localhost:${port}${path}`, certPem, {
+            method: "OPTIONS",
+            headers: {
+              Origin: PREVIEW_ORIGIN,
+              "Access-Control-Request-Method": path === "/v1/health" ? "GET" : "POST",
+            },
+          });
+          assert.equal(res.status, 204, `${path}のプリフライトが204ではない`);
+          assert.equal(res.headers["access-control-allow-origin"], PREVIEW_ORIGIN, `${path}で追加Originが許可されていない`);
+          assert.notEqual(res.headers["access-control-allow-origin"], "*", `${path}がAccess-Control-Allow-Origin: *を返している`);
+        }
+      } finally {
+        await started.close();
+      }
+    });
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(certDir, { recursive: true, force: true });
+  }
+});
+
+test("HTTPS CORS: 追加Origin設定後も、不許可originは引き続き拒否される", async () => {
+  const tmpDir = await makeTmpDir();
+  const certDir = await makeTmpDir();
+  try {
+    const { certPath, keyPath, certPem } = generateTestCertificate(certDir);
+    await withExtraAllowedOriginEnv(PREVIEW_ORIGIN, async () => {
+      const started = await startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath });
+      try {
+        const address = started.server.address();
+        const port = typeof address === "object" && address ? address.port : 0;
+        const res = await httpsRequestJson(`https://localhost:${port}/v1/health`, certPem, {
+          headers: { Origin: DISALLOWED_ORIGIN },
+        });
+        assert.equal(res.headers["access-control-allow-origin"], undefined);
+      } finally {
+        await started.close();
+      }
+    });
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(certDir, { recursive: true, force: true });
+  }
+});
+
+test("PNA: 追加Origin設定時も、PNA許可は許可済みOriginだけに返す", async () => {
+  const tmpDir = await makeTmpDir();
+  const certDir = await makeTmpDir();
+  try {
+    const { certPath, keyPath, certPem } = generateTestCertificate(certDir);
+    await withExtraAllowedOriginEnv(PREVIEW_ORIGIN, async () => {
+      const started = await startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath });
+      try {
+        const address = started.server.address();
+        const port = typeof address === "object" && address ? address.port : 0;
+
+        const allowedRes = await httpsRequestJson(`https://localhost:${port}/v1/audio`, certPem, {
+          method: "OPTIONS",
+          headers: {
+            Origin: PREVIEW_ORIGIN,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Private-Network": "true",
+          },
+        });
+        assert.equal(allowedRes.status, 204);
+        assert.equal(allowedRes.headers["access-control-allow-private-network"], "true");
+
+        const disallowedRes = await httpsRequestJson(`https://localhost:${port}/v1/audio`, certPem, {
+          method: "OPTIONS",
+          headers: {
+            Origin: DISALLOWED_ORIGIN,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Private-Network": "true",
+          },
+        });
+        assert.equal(disallowedRes.status, 403);
+        assert.equal(disallowedRes.headers["access-control-allow-private-network"], undefined);
+      } finally {
+        await started.close();
+      }
+    });
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+    await fs.rm(certDir, { recursive: true, force: true });
+  }
+});
+
+test("HTTPS CORS: 不正なCALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSが設定されている場合、Companionの起動そのものを拒否する", async () => {
+  const tmpDir = await makeTmpDir();
+  const certDir = await makeTmpDir();
+  try {
+    const { certPath, keyPath } = generateTestCertificate(certDir);
+    await withExtraAllowedOriginEnv("http://insecure.example.com", async () => {
+      // 証明書自体は有効（generateTestCertificateで生成）なので、拒否理由がTLSではなく
+      // Origin検証（httpsのみ許可）であることをエラーメッセージで確認する。
+      await assert.rejects(
+        startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath }),
+        /https/,
+      );
+    });
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
     await fs.rm(certDir, { recursive: true, force: true });
