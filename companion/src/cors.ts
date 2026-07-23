@@ -1,0 +1,48 @@
+// Origin完全一致によるCORS制御。ワイルドカードは使用しない。
+
+// DELETEはCORSの「simple method」ではないため、/v1/transcriptions/:jobId のキャンセルに
+// プリフライトが必要になる。ここに含めないとブラウザがキャンセルリクエストをブロックする。
+export const ALLOWED_METHODS = "GET, POST, DELETE, OPTIONS";
+export const ALLOWED_HEADERS =
+  "Authorization, Content-Type, X-CallFlow-Recording-Id, X-CallFlow-Company-Id, X-CallFlow-Duration-Ms";
+export const PREFLIGHT_MAX_AGE_SECONDS = 600;
+
+export function isOriginAllowed(origin: string | undefined, allowedOrigins: readonly string[]): boolean {
+  if (!origin) return false;
+  return allowedOrigins.includes(origin);
+}
+
+/** 許可されたOriginの場合のみCORSヘッダーを返す。許可されない場合はnull（ヘッダーを付けない）。 */
+export function corsHeadersFor(
+  origin: string | undefined,
+  allowedOrigins: readonly string[],
+): Record<string, string> | null {
+  if (!isOriginAllowed(origin, allowedOrigins)) return null;
+  return {
+    "Access-Control-Allow-Origin": origin as string,
+    Vary: "Origin",
+  };
+}
+
+/**
+ * requestPrivateNetworkは、プリフライトリクエストの
+ * `Access-Control-Request-Private-Network: true` ヘッダーの有無を渡す。
+ * 許可されたOriginの場合に限り `Access-Control-Allow-Private-Network: true` を返す
+ * （Chromeの Private Network Access / Local Network Access 対応。
+ * 未許可Originにはこのヘッダーを絶対に返さない）。
+ */
+export function preflightHeadersFor(
+  origin: string | undefined,
+  allowedOrigins: readonly string[],
+  requestPrivateNetwork = false,
+): Record<string, string> | null {
+  const base = corsHeadersFor(origin, allowedOrigins);
+  if (!base) return null;
+  return {
+    ...base,
+    "Access-Control-Allow-Methods": ALLOWED_METHODS,
+    "Access-Control-Allow-Headers": ALLOWED_HEADERS,
+    "Access-Control-Max-Age": String(PREFLIGHT_MAX_AGE_SECONDS),
+    ...(requestPrivateNetwork ? { "Access-Control-Allow-Private-Network": "true" } : {}),
+  };
+}
