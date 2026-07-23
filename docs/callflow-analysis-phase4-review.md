@@ -112,3 +112,30 @@ P0は無し。指摘はすべて実装時に反映済み（turnタイムアウ�
 再実行結果: `node --test src/lib/analysis-datetime.test.ts`＝13/13、`npm test`＝142/142、`npm run companion:test`＝120/120（新規6件含む）、`npm run lint`＝0エラー、`npx tsc --noEmit`＝エラーなし、`npm run build`（フラグ有効/無効）両方成功、`git diff --check`＝クリーン。
 
 コミット: `4c37221 fix: apply analyzed follow-up date correctly`（ローカルのみ、push・PR・main反映なし）。
+
+---
+
+## 8. 追加修正: PreviewログインのデモモードUI導線欠落（2026-07-23）
+
+PR #5のVercel Previewでの通しテスト中に発見された不具合。Supabase未設定＋デモモード許可（`NEXT_PUBLIC_ALLOW_DEMO=true`）の状態でも、`/login`画面に「デモ版を開く」ボタンが存在せず、Googleログインボタンしか表示されなかった（URLを手動で`/dashboard`へ変更すればデモモードには入れたが、想定していた入口が機能していなかった）。
+
+### 修正内容
+
+- 新規`src/lib/login-demo-entry.ts`：`shouldShowDemoEntry(isSupabaseConfigured, isDemoModeAllowed)`という純粋関数を追加（`!isSupabaseConfigured && isDemoModeAllowed`）
+- `src/app/login/page.tsx`：この関数の戻り値が`true`の場合のみ、区切り線と「デモ版を開く（データ保存なし）」ボタン（`/dashboard`への遷移）を表示。Supabase未設定時の案内文言も、デモ許可時はわかりやすい案内文（灰色）へ、デモ不許可時は既存の赤いエラー文言のままとした
+- デモ版ボタンはGoogleログインボタン（`btn-primary`、実線・青塗り）と視覚的に区別されるスタイル（`btn-light`、白背景・灰色文字・「✦」プレフィックス）にした
+- 新規`src/lib/login-demo-entry.test.ts`（3件）：Supabase設定済み／未設定＋デモ許可／未設定＋デモ不許可の組み合わせを検証
+
+### レビュー
+
+独立したOpusサブエージェント（新規インスタンス）による差分レビューを実施。
+
+**判定: SHIP**（P0・P1・P2なし）
+
+検出事項（いずれもP3、非ブロッキング）:
+- `border-dashed`スタイルが`.btn-light`の既存`border`指定とのカスケード順次第で視覚上効かない可能性があるが、色・文言・区切り線により視覚的区別自体は十分に担保されている
+- `<a href="/dashboard">`はNext.jsの`Link`ではなく素のアンカーのためフルページ遷移になるが、デモ導線としては問題なし
+
+`shouldShowDemoEntry`の条件が、既存の`proxy.ts`（`/dashboard`への到達可否判定）・`data.ts`（`loadCRMData`のデモモード分岐）の条件と完全に一致していることも確認された。本番環境（Supabase設定済み）で誤ってデモボタンが表示されるリスクはなし。
+
+再実行結果: `node --test src/lib/login-demo-entry.test.ts`＝3/3、`npm test`＝145/145、`npm run lint`＝0エラー、`npx tsc --noEmit`＝エラーなし、`npm run build`（フラグ有効/無効）両方成功、`git diff --check`＝クリーン。

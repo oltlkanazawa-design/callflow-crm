@@ -328,6 +328,26 @@ Phase 3Aのffmpeg・whisper.cppを、既存のHTTPS版Companion（Phase 2B）へ
 
 ---
 
+## 9-7. PR #5 Vercel Preview通しテスト結果
+
+実施日: 2026-07-23
+
+PR #5（`feature/local-call-recorder-codex` → `main`）のVercel Previewへ、ブランチ限定のPreview専用環境変数（`NEXT_PUBLIC_SUPABASE_URL=https://YOUR_PROJECT.supabase.co`等のダミー値、`NEXT_PUBLIC_ALLOW_DEMO=true`、録音・Companion・文字起こし・解析の4フラグを`true`）を設定し、本番Supabase・本番Vercel環境変数には一切触れずに、実機（MacBook Air内蔵マイク・iPhoneスピーカー通話音声）での通しテストを実施した。
+
+**確認できた内容**：
+- Previewはデモモード（localStorageベース）で起動し、本番Supabaseデータは一切表示されなかった
+- ブラウザ録音UIが表示され、MacBook Air内蔵マイクでの録音に成功
+- PreviewからローカルのHTTPS Companion（`CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINS`でPreview originを追加許可）へ接続・ペアリングに成功
+- Mac内のWhisperによる文字起こしに成功
+- Codex App Serverによる営業内容の解析に成功
+- 解析結果の架電結果・会話メモ・次回対応日への反映に成功
+- 「記録して次へ」（実際のデータ保存）は押しておらず、架電記録としては保存していない
+- 本番（Production）への反映は一切なし。PR #5は未マージのまま
+
+**発見・修正したUI不具合**：`/login`画面で、Supabase未設定＋デモモード許可中であるにもかかわらず「デモ版を開く」ボタンが表示されず、Googleログインボタンしか無い状態になっていた（URLを手動で`/dashboard`へ変更すればデモモードには入れたが、想定していた入口が機能していなかった）。`src/app/login/page.tsx`に、Supabase未設定かつデモモード許可時のみ表示される「デモ版を開く」導線を追加し、Supabase設定済みの本番環境やデモモード不許可時には表示されないことを独立レビュー・自動テストで確認した上で修正した。詳細は[docs/callflow-analysis-phase4-review.md](./callflow-analysis-phase4-review.md) §8を参照。
+
+---
+
 ## 10. 技術的リスク
 
 - ~~whisper.cppの精度・速度が実用に耐えるか未検証~~ → **解消（2026-07-22）**。Phase 3Aで実機ベンチマーク済み、詳細は[docs/callflow-transcription-phase3a.md](./callflow-transcription-phase3a.md)参照。
