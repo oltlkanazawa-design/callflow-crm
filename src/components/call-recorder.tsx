@@ -556,7 +556,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
       notify("表示中の企業が録音時と異なるため、文字起こしできません");
       return;
     }
-    if (transcriptionState !== "idle" && transcriptionState !== "failed" && transcriptionState !== "cancelled") return;
+    if (transcriptionState !== "idle" && transcriptionState !== "failed" && transcriptionState !== "cancelled" && transcriptionState !== "completed") return;
 
     const consent = window.confirm(COMPANION_CONSENT_MESSAGE);
     if (!consent) return;
@@ -647,7 +647,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
       notify("表示中の企業が録音・文字起こし時と異なるため、解析できません");
       return;
     }
-    if (analysisState !== "idle" && analysisState !== "failed" && analysisState !== "cancelled") return;
+    if (analysisState !== "idle" && analysisState !== "failed" && analysisState !== "cancelled" && analysisState !== "completed") return;
 
     const consent = window.confirm(ANALYSIS_CONSENT_MESSAGE);
     if (!consent) return;

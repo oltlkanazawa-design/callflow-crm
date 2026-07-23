@@ -56,6 +56,9 @@ export default function CallFlowApp() {
   const [importModal,setImportModal] = useState(false);
   const [csvModal,setCsvModal] = useState(false);
   const [blockModal,setBlockModal] = useState<Company|null>(null);
+  // 通話録音系のfeature flagとは独立した、既存のルールベース文字起こし解析（外部AI APIキー不要）。
+  // flagがすべて無効な環境でも従来どおり利用できるようにする。
+  const [aiModal,setAiModal] = useState(false);
   const [toast,setToast] = useState("");
   // 通話録音のロック状態（録音中はハードロック、保存前の録音が残っている間はソフトロック）
   const [recordingLock,setRecordingLock] = useState<CallRecorderLockState>({isRecording:false,hasPendingAudio:false});
@@ -127,7 +130,7 @@ export default function CallFlowApp() {
     </aside>
     {menu&&<button className="fixed inset-0 z-30 bg-slate-950/50 lg:hidden" onClick={()=>setMenu(false)} aria-label="メニューを閉じる"/>}
     <main className="min-h-screen lg:ml-[238px]">
-      <header className="flex min-h-[76px] items-center justify-between gap-3 px-4 md:px-8"><div className="flex items-center gap-3"><button className="lg:hidden" onClick={()=>setMenu(true)}><Menu/></button><div><h1 className="text-xl font-extrabold tracking-tight md:text-2xl">{meta[view][0]}</h1><p className="mt-1 hidden text-xs text-slate-500 sm:block">{meta[view][1]}</p></div></div><div className="flex gap-2"><select className="input hidden !w-auto md:block" value={viewFilterMemberId} onChange={e=>setViewFilterMemberId(e.target.value)} aria-label="担当者で絞り込み"><option value="all">全員</option>{activeMemberOptions(allMembers).map(m=><option key={m.id} value={m.id}>{m.full_name}</option>)}</select></div></header>
+      <header className="flex min-h-[76px] items-center justify-between gap-3 px-4 md:px-8"><div className="flex items-center gap-3"><button className="lg:hidden" onClick={()=>setMenu(true)}><Menu/></button><div><h1 className="text-xl font-extrabold tracking-tight md:text-2xl">{meta[view][0]}</h1><p className="mt-1 hidden text-xs text-slate-500 sm:block">{meta[view][1]}</p></div></div><div className="flex gap-2"><select className="input hidden !w-auto md:block" value={viewFilterMemberId} onChange={e=>setViewFilterMemberId(e.target.value)} aria-label="担当者で絞り込み"><option value="all">全員</option>{activeMemberOptions(allMembers).map(m=><option key={m.id} value={m.id}>{m.full_name}</option>)}</select><button className="btn btn-ai" onClick={()=>setAiModal(true)}><Sparkles size={15}/><span className="hidden sm:inline">文字起こし解析</span></button></div></header>
       <div className="px-4 pb-10 md:px-8">{loading?<Loading/>:<>
         {view==="dashboard"&&<Dashboard companies={filteredCompanies} logs={filteredLogs} go={go}/>}
         {view==="companies"&&<Companies companies={filteredCompanies} callCompany={callCompany} add={()=>setCompanyModal(true)} bulkImport={()=>setImportModal(true)} csvImport={()=>setCsvModal(true)} isAdmin={isAdmin} toggleBlock={c=>setBlockModal(c)}/>}
@@ -140,6 +143,7 @@ export default function CallFlowApp() {
     {importModal&&<LeadImportModal member={currentUserName} existing={companies} close={()=>setImportModal(false)} saved={async s=>{await refresh();setImportModal(false);notify(`${s.inserted}件の営業先を取り込みました${s.skipped||s.blocked?`（重複${s.skipped}件・架電禁止${s.blocked}件はスキップ）`:""}`)}} notify={notify}/>}
     {csvModal&&<CsvImportModal member={currentUserName} existing={companies} close={()=>setCsvModal(false)} saved={async summary=>{await refresh();setCsvModal(false);notify(`新規${summary.newCount}件・更新${summary.updatedCount}件を登録しました（スキップ${summary.skippedCount}件・架電禁止${summary.blockedCount}件・エラー${summary.errorCount}件）`)}} notify={notify}/>}
     {blockModal&&<BlockModal company={blockModal} close={()=>setBlockModal(null)} done={async()=>{await refresh();setBlockModal(null)}} notify={notify}/>}
+    {aiModal&&<TranscriptModal company={callableCompanies[callIndex]} close={()=>setAiModal(false)} onApply={(a,transcript)=>{sessionStorage.setItem("callflow_analysis",JSON.stringify({...a,transcript}));setAiModal(false);go("call");notify("解析結果を架電記録へ反映しました")}}/>}
     {toast&&<div className="fixed bottom-6 right-6 z-[70] rounded-xl bg-[#152039] px-5 py-3 text-sm font-semibold text-white shadow-2xl">{toast}</div>}
     {!isSupabaseConfigured&&<div className="fixed bottom-3 left-3 z-20 rounded-full bg-amber-100 px-3 py-1 text-[10px] font-bold text-amber-800 lg:left-[250px]">デモモード</div>}
   </div>;
@@ -167,7 +171,8 @@ function CallScreen({company,hasBlockedRemaining,member,next,onSaved,notify,reco
  const [nextAtTime,setNextAtTime]=useState(()=>splitAnalysisDateTime(staged?.next_action_at||null).time);
  const [saving,setSaving]=useState(false);
  // Codex解析結果（Phase 4）。CallRecorder内の「架電フォームへ反映」から直接受け取る
- // （旧TranscriptModalのsessionStorage経由の仕組みとは独立。あちらは現在どこからも呼ばれていない）。
+ // （旧TranscriptModal＝ヘッダーの「文字起こし解析」のsessionStorage経由の仕組みとは独立。
+ // 旧機能は録音系feature flagとは無関係に引き続き利用できる別経路として残している）。
  const [appliedAnalysis,setAppliedAnalysis]=useState<AppliedAnalysisFields|null>(null);
  const applyAnalysis=(fields:AppliedAnalysisFields)=>{
   setResult(fields.result as CallResult);
