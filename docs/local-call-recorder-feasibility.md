@@ -348,6 +348,10 @@ Phase 3Aのffmpeg・whisper.cppを、既存のHTTPS版Companion（Phase 2B）へ
 - 録音前の5秒マイクテストの実施
 - 解析結果を保存前に必ず内容を確認すること
 
+**本番反映に関する前提（重要）**: `NEXT_PUBLIC_CALL_RECORDING_ENABLED`・`NEXT_PUBLIC_CALL_COMPANION_ENABLED`・`NEXT_PUBLIC_CALL_TRANSCRIPTION_ENABLED`・`NEXT_PUBLIC_CALL_ANALYSIS_ENABLED`はいずれもコード上`=== "true"`の厳密一致でのみ有効化されるため、**環境変数を明示的に設定しない限り既定値はfalse（無効）**である。本番Vercelにはこれらの環境変数を**まだ一切設定していない**ため、本番反映後もこの機能群は既定で非表示・非動作のままであり、既存の架電・企業管理等の機能には影響しない。
+
+**本ブランチのスコープについて**: 本ブランチはこの通話録音・文字起こし・Codex解析機能のみを対象とし、DBマイグレーション・SQL変更は一切含まない。既にorigin/mainへマージ済みの企業安全管理機能（company-safety）のうち、`supabase/harden-company-writes-stage-b.sql`（Stage B、書き込み経路の追加的な強化）は本ブランチとは無関係に、従来どおり**未適用のまま**である。本ブランチ自体もこの時点では**本番（Vercel本番環境・本番Supabase）へは一切反映していない**。
+
 ---
 
 ## 12. 推奨する最終構成
