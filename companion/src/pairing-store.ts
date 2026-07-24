@@ -32,6 +32,37 @@ function isValidStoreFile(value: unknown): value is TokenStoreFile {
 }
 
 /**
+ * 現在の実行ユーザーのUIDを返す。process.getuidが存在しない環境（Windows等）では
+ * nullを返し、呼び出し側は所有者チェックだけを安全にスキップする。
+ */
+function currentUidIfAvailable(): number | null {
+  return typeof process.getuid === "function" ? process.getuid() : null;
+}
+
+function hasExactMode(mode: number, expected: number): boolean {
+  return (mode & 0o777) === expected;
+}
+
+/**
+ * 保存先ディレクトリが「symlinkではない通常のディレクトリ・（可能なら）現在の実行ユーザーが
+ * 所有・権限がちょうど0700」であることを検証する。1つでも満たさない場合はfalseを返す
+ * （例外は投げない＝呼び出し側は安全に「読み込み不可」として扱える）。
+ */
+async function isSecureDir(dirPath: string): Promise<boolean> {
+  let stat;
+  try {
+    stat = await fsp.lstat(dirPath);
+  } catch {
+    return false;
+  }
+  if (stat.isSymbolicLink() || !stat.isDirectory()) return false;
+  const uid = currentUidIfAvailable();
+  if (uid !== null && stat.uid !== uid) return false;
+  if (!hasExactMode(stat.mode, DIR_MODE)) return false;
+  return true;
+}
+
+/**
  * ディレクトリを安全に確保する。symlinkや通常ディレクトリでない何かが既に存在する場合は
  * 削除して作り直す（destinationがsymlinkだと後続の書き込みが意図しない場所へ及ぶ恐れがあるため）。
  * 既存ディレクトリの権限が緩い場合に備えて、最後に必ず0700へ締め直す。
@@ -55,21 +86,34 @@ async function ensureSecureDir(dirPath: string): Promise<void> {
 
 /**
  * 保存済みトークンハッシュを読み込む。
- * ファイルが存在しない・JSONとして壊れている・スキーマが不正・symlinkである等、
- * いずれの異常でも例外を投げず空配列を返す（＝安全に未ペアリング状態として扱われる）。
- * トークンの値そのものはログへ一切出力しない。
+ * ファイルが存在しない・JSONとして壊れている・スキーマが不正・symlinkである・
+ * ディレクトリ/ファイルの所有者や権限が想定と異なる等、いずれの異常でも例外を投げず
+ * 空配列を返す（＝安全に未ペアリング状態として扱われる）。トークンの値そのものは
+ * ログへ一切出力しない。
  *
- * O_NOFOLLOWで開くことで、symlinkかどうかの確認とその後の読み込みを1回のopen呼び出しに
- * まとめている（別々にlstat→readFileする場合に生じ得る、チェックと読み込みの間の
- * すり替えを防ぐため）。以後のisFile確認・読み込みは、開いた後のfile handle自体に対して
- * 行うため、パスがその後どう変わっても影響を受けない。
+ * 保存先ディレクトリが通常のディレクトリ・非symlink・（可能なら）現在の実行ユーザー所有・
+ * 権限0700であることをまず確認する。次にファイルをO_NOFOLLOWで開くことで、symlinkかどうかの
+ * 確認とその後の読み込みを1回のopen呼び出しにまとめる（別々にlstat→readFileする場合に
+ * 生じ得る、チェックと読み込みの間のすり替えを防ぐため）。以後のisFile・所有者・権限の
+ * 確認・読み込みは、開いた後のfile handle自体に対して行うため、パスがその後どう変わっても
+ * 影響を受けない。process.getuidが存在しない環境では所有者チェックのみ安全にスキップする。
  */
 export async function loadTokenStore(filePath: string): Promise<IssuedToken[]> {
+  const dir = path.dirname(filePath);
   let handle: fsp.FileHandle | undefined;
   try {
-    handle = await fsp.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    if (!(await isSecureDir(dir))) return [];
+
+    // O_NONBLOCKも付与する。万一そのパスにFIFO（名前付きパイプ）が置かれていた場合でも、
+    // openがwriter待ちでブロックしてCompanionの起動そのものが止まってしまうことを防ぐ
+    // （通常ファイルに対してはO_NONBLOCKは無害で、読み込み挙動に一切影響しない）。
+    handle = await fsp.open(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
     const stat = await handle.stat();
     if (!stat.isFile()) return [];
+    const uid = currentUidIfAvailable();
+    if (uid !== null && stat.uid !== uid) return [];
+    if (!hasExactMode(stat.mode, FILE_MODE)) return [];
+
     const raw = await handle.readFile("utf8");
     const parsed: unknown = JSON.parse(raw);
     if (!isValidStoreFile(parsed)) return [];

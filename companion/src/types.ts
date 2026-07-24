@@ -42,6 +42,9 @@ export interface PairSuccessResponseBody {
   ok: true;
   token: string;
   tokenType: "Bearer";
+  /** falseの場合、今回のセッションでは認証済みだが、Mac側への永続化に失敗している
+   * （＝Companion再起動後に再ペアリングが必要になる可能性がある）。 */
+  persisted: boolean;
 }
 
 export type PairFailureReason =

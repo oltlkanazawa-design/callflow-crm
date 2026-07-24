@@ -184,6 +184,69 @@ test("ensureSecureDir相当: 保存先ディレクトリがsymlinkの場合で�
   }
 });
 
+// ===========================================================
+// ディレクトリ・ファイルの所有者・権限検証（loadTokenStore）
+// ===========================================================
+
+test("loadTokenStore: ファイルの権限が0644の場合は読み込まず空配列を返す", async () => {
+  const dir = await makeTmpDir();
+  try {
+    const storePath = path.join(dir, "pairing-tokens.json");
+    const tokens: IssuedToken[] = [{ tokenHash: sampleHash(), issuedAt: 1 }];
+    await saveTokenStore(storePath, tokens);
+    await fs.chmod(storePath, 0o644);
+    assert.deepEqual(await loadTokenStore(storePath), []);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadTokenStore: ファイルの権限が0666の場合は読み込まず空配列を返す", async () => {
+  const dir = await makeTmpDir();
+  try {
+    const storePath = path.join(dir, "pairing-tokens.json");
+    const tokens: IssuedToken[] = [{ tokenHash: sampleHash(), issuedAt: 1 }];
+    await saveTokenStore(storePath, tokens);
+    await fs.chmod(storePath, 0o666);
+    assert.deepEqual(await loadTokenStore(storePath), []);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadTokenStore: 保存先ディレクトリの権限が0755の場合は読み込まず空配列を返す", async () => {
+  const dir = await makeTmpDir();
+  try {
+    const subDir = path.join(dir, "sub");
+    const storePath = path.join(subDir, "pairing-tokens.json");
+    const tokens: IssuedToken[] = [{ tokenHash: sampleHash(), issuedAt: 1 }];
+    await saveTokenStore(storePath, tokens);
+    await fs.chmod(subDir, 0o755);
+    assert.deepEqual(await loadTokenStore(storePath), []);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("loadTokenStore: ディレクトリ0700・ファイル0600の正常な状態は復元に成功する", async () => {
+  const dir = await makeTmpDir();
+  try {
+    const subDir = path.join(dir, "sub");
+    const storePath = path.join(subDir, "pairing-tokens.json");
+    const tokens: IssuedToken[] = [{ tokenHash: sampleHash(), issuedAt: 123 }];
+    await saveTokenStore(storePath, tokens);
+
+    const dirStat = await fs.stat(subDir);
+    const fileStat = await fs.stat(storePath);
+    assert.equal(dirStat.mode & 0o777, 0o700);
+    assert.equal(fileStat.mode & 0o777, 0o600);
+
+    assert.deepEqual(await loadTokenStore(storePath), tokens);
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("saveTokenStore → loadTokenStore: 空配列も正しく往復する（全失効後の状態）", async () => {
   const dir = await makeTmpDir();
   try {

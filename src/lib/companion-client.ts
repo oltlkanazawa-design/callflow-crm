@@ -312,7 +312,14 @@ export async function checkCompanionHealth(baseUrl: string, options: RequestOpti
 // ---------------------------------------------------------
 // Pairing
 // ---------------------------------------------------------
-export async function pairWithCompanion(baseUrl: string, code: string, options: RequestOptions = {}): Promise<string> {
+export interface CompanionPairResult {
+  token: string;
+  /** falseの場合、Mac側への永続化に失敗している（今回のセッションでは利用できるが、
+   * Companion再起動後に再ペアリングが必要になる可能性がある）。 */
+  persisted: boolean;
+}
+
+export async function pairWithCompanion(baseUrl: string, code: string, options: RequestOptions = {}): Promise<CompanionPairResult> {
   assertValidCompanionUrl(baseUrl);
   const res = await fetchWithTimeout(
     `${baseUrl}/v1/pair`,
@@ -327,8 +334,8 @@ export async function pairWithCompanion(baseUrl: string, code: string, options: 
   if (!res.ok) {
     throw await parseErrorResponse(res);
   }
-  const body = (await res.json()) as { ok: true; token: string };
-  return body.token;
+  const body = (await res.json()) as { ok: true; token: string; persisted: boolean };
+  return { token: body.token, persisted: body.persisted };
 }
 
 /**

@@ -500,13 +500,17 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     setPairingBusy(true);
     setPairingError(null);
     try {
-      const token = await pairWithCompanion(getCompanionBaseUrl(), pairingCodeInput);
+      const { token, persisted } = await pairWithCompanion(getCompanionBaseUrl(), pairingCodeInput);
       storeToken(token);
       setCompanionToken(token);
       setCompanionConnectionStatus("connected");
       setShowPairingForm(false);
       setPairingCodeInput("");
-      notify("Macの処理アプリとペアリングしました");
+      if (persisted) {
+        notify("Macの処理アプリとペアリングしました");
+      } else {
+        notify("接続には成功しましたが、Mac側への保存に失敗しました。Companion再起動後に再ペアリングが必要になる可能性があります");
+      }
     } catch (error) {
       setPairingError(companionErrorMessage(error));
     } finally {

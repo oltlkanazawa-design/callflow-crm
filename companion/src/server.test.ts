@@ -199,6 +199,53 @@ test("POST /v1/pair: 正しいコードでトークンが発行される", async
   });
 });
 
+test("POST /v1/pair: 正常な永続化ができる場合、レスポンスはpersisted:trueを含む", async () => {
+  await withServer({}, async (started, baseUrl) => {
+    const res = await fetch(`${baseUrl}/v1/pair`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: started.pairing.currentCode }),
+    });
+    const body = await readJson<Record<string, unknown>>(res);
+    assert.equal(body.ok, true);
+    assert.equal(body.persisted, true);
+  });
+});
+
+test("POST /v1/pair: 永続化に失敗しても、そのセッション内のトークンは認証に成功し、persisted:falseを返す", async () => {
+  const tmpDir = await makeTmpDir();
+  const tokenParentDir = await makeTmpDir();
+  const tokenStorePath = path.join(tokenParentDir, "unwritable-dir", "pairing-tokens.json");
+  try {
+    // tokenStorePathの親ディレクトリ自体は存在しない。その祖先(tokenParentDir)から
+    // 書き込み権限を外すことで、ensureSecureDirのmkdirがEACCESで失敗する状況を再現する
+    // （ensureSecureDirは対象ディレクトリ自身の権限は必ず0700へ締め直すが、祖先の権限までは
+    // 変更できないため、この制約は自己修復されない）。
+    await fs.chmod(tokenParentDir, 0o500);
+
+    await withServer({ tmpDir, tokenStorePath }, async (started, baseUrl) => {
+      const res = await fetch(`${baseUrl}/v1/pair`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code: started.pairing.currentCode }),
+      });
+      const body = await readJson<Record<string, unknown>>(res);
+      assert.equal(body.ok, true);
+      assert.equal(body.persisted, false, "書き込み権限が無いため永続化は失敗するはず");
+      assert.equal(typeof body.token, "string");
+
+      // 永続化に失敗していても、今回のセッション内ではそのトークンで引き続き認証できる。
+      const statusRes = await fetch(`${baseUrl}/v1/pair/status`, {
+        headers: { Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${body.token}` },
+      });
+      assert.equal(statusRes.status, 200, "永続化失敗は今回のセッション内の認証には影響しないはず");
+    });
+  } finally {
+    await fs.chmod(tokenParentDir, 0o700);
+    await fs.rm(tokenParentDir, { recursive: true, force: true });
+  }
+});
+
 test("POST /v1/pair: 間違ったコードは401になる", async () => {
   await withServer({}, async (started, baseUrl) => {
     const wrong = started.pairing.currentCode === "000000" ? "111111" : "000000";

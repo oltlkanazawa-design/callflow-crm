@@ -174,8 +174,8 @@ export function createRequestListener(
       const code = typeof (parsed as PairRequestBody | undefined)?.code === "string" ? (parsed as PairRequestBody).code : "";
       const result = pairing.attemptPair(code);
       if (result.ok) {
-        await persistPairingTokens(config, pairing);
-        sendJson(res, 200, { ok: true, token: result.token, tokenType: "Bearer" }, cors);
+        const persisted = await persistPairingTokens(config, pairing);
+        sendJson(res, 200, { ok: true, token: result.token, tokenType: "Bearer", persisted }, cors);
         return;
       }
       const status = result.reason === "too_many_attempts" ? 429 : 401;

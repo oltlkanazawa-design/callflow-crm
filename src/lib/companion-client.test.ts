@@ -130,13 +130,27 @@ test("checkCompanionHealth: 失敗時はCompanionClientErrorを投げる", async
 // ---------------------------------------------------------
 // pairing
 // ---------------------------------------------------------
-test("pairWithCompanion: 成功時にトークンを返す", async () => {
+test("pairWithCompanion: 成功時にtokenとpersistedを返す", async () => {
   await withInsecureHttpAllowed(() =>
     withMockFetch(
-      (async () => jsonResponse(200, { ok: true, token: "tok_xyz", tokenType: "Bearer" })) as typeof fetch,
+      (async () => jsonResponse(200, { ok: true, token: "tok_xyz", tokenType: "Bearer", persisted: true })) as typeof fetch,
       async () => {
-        const token = await pairWithCompanion("http://127.0.0.1:4318", "123456");
-        assert.equal(token, "tok_xyz");
+        const result = await pairWithCompanion("http://127.0.0.1:4318", "123456");
+        assert.equal(result.token, "tok_xyz");
+        assert.equal(result.persisted, true);
+      },
+    ),
+  );
+});
+
+test("pairWithCompanion: persisted:falseの場合もtokenは返し、falseをそのまま伝える（永続化失敗の可視化）", async () => {
+  await withInsecureHttpAllowed(() =>
+    withMockFetch(
+      (async () => jsonResponse(200, { ok: true, token: "tok_xyz", tokenType: "Bearer", persisted: false })) as typeof fetch,
+      async () => {
+        const result = await pairWithCompanion("http://127.0.0.1:4318", "123456");
+        assert.equal(result.token, "tok_xyz");
+        assert.equal(result.persisted, false);
       },
     ),
   );
