@@ -8,6 +8,9 @@ import {
   clearStoredToken,
   checkCompanionHealth,
   pairWithCompanion,
+  checkPairingStatus,
+  revokePairing,
+  revokeAllPairings,
   uploadRecordingToCompanion,
   companionErrorMessage,
   CompanionClientError,
@@ -152,6 +155,95 @@ test("pairWithCompanion: 間違ったコードはinvalid_codeとしてCompanionC
           assert.equal((error as CompanionClientError).code, "invalid_code");
           assert.equal((error as CompanionClientError).httpStatus, 401);
         }
+      },
+    ),
+  );
+});
+
+// ---------------------------------------------------------
+// 信頼済み端末方式：status確認・revoke・revoke-all
+// ---------------------------------------------------------
+test("checkPairingStatus: 成功時にtrueを返し、Authorizationヘッダーを送信する", async () => {
+  let capturedInit: RequestInit | undefined;
+  await withInsecureHttpAllowed(() =>
+    withMockFetch(
+      (async (_url: string, init?: RequestInit) => {
+        capturedInit = init;
+        return jsonResponse(200, { ok: true, paired: true });
+      }) as typeof fetch,
+      async () => {
+        const paired = await checkPairingStatus("http://127.0.0.1:4318", "my-token");
+        assert.equal(paired, true);
+        const headers = capturedInit?.headers as Record<string, string>;
+        assert.equal(headers.Authorization, "Bearer my-token");
+      },
+    ),
+  );
+});
+
+test("checkPairingStatus: 401はunauthorizedとしてCompanionClientErrorを投げる（再ペアリングを促すべき条件）", async () => {
+  await withInsecureHttpAllowed(() =>
+    withMockFetch(
+      (async () => jsonResponse(401, { ok: false, error: "unauthorized", message: "..." })) as typeof fetch,
+      async () => {
+        await assert.rejects(
+          () => checkPairingStatus("http://127.0.0.1:4318", "stale-token"),
+          (error: unknown) => error instanceof CompanionClientError && error.code === "unauthorized",
+        );
+      },
+    ),
+  );
+});
+
+test("checkPairingStatus: ネットワークエラー（Companion未起動）はnetwork_errorであり、unauthorizedとは区別される", async () => {
+  await withInsecureHttpAllowed(() =>
+    withMockFetch(
+      (async () => {
+        throw new TypeError("fetch failed");
+      }) as typeof fetch,
+      async () => {
+        await assert.rejects(
+          () => checkPairingStatus("http://127.0.0.1:4318", "my-token"),
+          (error: unknown) => error instanceof CompanionClientError && error.code === "network_error",
+        );
+      },
+    ),
+  );
+});
+
+test("revokePairing: 成功時に失効件数を返す", async () => {
+  await withInsecureHttpAllowed(() =>
+    withMockFetch(
+      (async () => jsonResponse(200, { ok: true, revokedCount: 1, persisted: true })) as typeof fetch,
+      async () => {
+        const result = await revokePairing("http://127.0.0.1:4318", "my-token");
+        assert.equal(result.revokedCount, 1);
+        assert.equal(result.persisted, true);
+      },
+    ),
+  );
+});
+
+test("revokePairing: persisted:falseの場合はそのまま呼び出し側へ伝える（永続化失敗の可視化）", async () => {
+  await withInsecureHttpAllowed(() =>
+    withMockFetch(
+      (async () => jsonResponse(200, { ok: true, revokedCount: 1, persisted: false })) as typeof fetch,
+      async () => {
+        const result = await revokePairing("http://127.0.0.1:4318", "my-token");
+        assert.equal(result.persisted, false);
+      },
+    ),
+  );
+});
+
+test("revokeAllPairings: 成功時に失効件数を返す", async () => {
+  await withInsecureHttpAllowed(() =>
+    withMockFetch(
+      (async () => jsonResponse(200, { ok: true, revokedCount: 3, persisted: true })) as typeof fetch,
+      async () => {
+        const result = await revokeAllPairings("http://127.0.0.1:4318", "my-token");
+        assert.equal(result.revokedCount, 3);
+        assert.equal(result.persisted, true);
       },
     ),
   );
@@ -327,4 +419,13 @@ test("checkCompanionHealth/pairWithCompanion/uploadRecordingToCompanion: 不正�
     () => uploadRecordingToCompanion("https://evil.example.com:4318", "tok", blob, { recordingId: "r", companyId: null, durationMs: 0 }),
     (error: unknown) => error instanceof CompanionClientError && error.code === "invalid_companion_url",
   );
+  await assert.rejects(() => checkPairingStatus("https://evil.example.com:4318", "tok"), (error: unknown) => {
+    return error instanceof CompanionClientError && error.code === "invalid_companion_url";
+  });
+  await assert.rejects(() => revokePairing("https://evil.example.com:4318", "tok"), (error: unknown) => {
+    return error instanceof CompanionClientError && error.code === "invalid_companion_url";
+  });
+  await assert.rejects(() => revokeAllPairings("https://evil.example.com:4318", "tok"), (error: unknown) => {
+    return error instanceof CompanionClientError && error.code === "invalid_companion_url";
+  });
 });

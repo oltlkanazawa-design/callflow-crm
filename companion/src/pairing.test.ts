@@ -1,8 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import { PairingManager, createPairingSession } from "./pairing.ts";
 
 const BASE_CONFIG = { pairingCodeTtlMs: 10 * 60 * 1000, pairingMaxAttempts: 5 };
+
+function hashTokenForTest(token: string): string {
+  return crypto.createHash("sha256").update(token, "utf8").digest("hex");
+}
 
 test("createPairingSession: 6桁の数字コードを生成する", () => {
   const session = createPairingSession(1000, 60_000);
@@ -100,4 +105,72 @@ test("regenerate: 新しいコードを再発行するとトークンは維持�
   if (result.ok) {
     assert.equal(manager.verifyToken(`Bearer ${result.token}`), true);
   }
+});
+
+// ===========================================================
+// 永続化されたトークンのハイドレーション・失効（信頼済み端末方式）
+// ===========================================================
+
+test("コンストラクタ: persistedTokensから復元したハッシュに一致するトークンはverifyTokenを通る（Companion再起動の相当試験）", () => {
+  const rawToken = "restored-raw-token-from-previous-session";
+  const persisted = [{ tokenHash: hashTokenForTest(rawToken), issuedAt: 500 }];
+  // 「新しいPairingManagerインスタンス」＝Companionプロセス再起動を模擬する。
+  // attemptPairを一度も呼ばずにverifyTokenが通ることが、再ペアリング不要であることの証明になる。
+  const manager = new PairingManager(BASE_CONFIG, 1000, persisted);
+  assert.equal(manager.verifyToken(`Bearer ${rawToken}`), true);
+  assert.equal(manager.issuedTokenCount, 1);
+});
+
+test("コンストラクタ: persistedTokensに無いトークンは引き続き拒否される", () => {
+  const persisted = [{ tokenHash: hashTokenForTest("some-other-token"), issuedAt: 500 }];
+  const manager = new PairingManager(BASE_CONFIG, 1000, persisted);
+  assert.equal(manager.verifyToken("Bearer unknown-token"), false);
+});
+
+test("listStoredTokens: attemptPair成功後、永続化用のハッシュ一覧に反映される（生トークンは含まれない）", () => {
+  const manager = new PairingManager(BASE_CONFIG, 1000);
+  const result = manager.attemptPair(manager.currentCode, 1000);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  const stored = manager.listStoredTokens();
+  assert.equal(stored.length, 1);
+  assert.equal(stored[0].tokenHash, hashTokenForTest(result.token));
+  assert.doesNotMatch(JSON.stringify(stored), new RegExp(result.token));
+});
+
+test("revokeCurrentToken: 現在のトークンを失効させると、以後verifyTokenは拒否する", () => {
+  const manager = new PairingManager(BASE_CONFIG, 1000);
+  const result = manager.attemptPair(manager.currentCode, 1000);
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  assert.equal(manager.verifyToken(`Bearer ${result.token}`), true);
+  const revoked = manager.revokeCurrentToken(`Bearer ${result.token}`);
+  assert.equal(revoked, true);
+  assert.equal(manager.verifyToken(`Bearer ${result.token}`), false);
+  assert.equal(manager.issuedTokenCount, 0);
+});
+
+test("revokeCurrentToken: 既に無効なトークン・不正なヘッダーはfalseを返し何も変化しない", () => {
+  const manager = new PairingManager(BASE_CONFIG, 1000);
+  const result = manager.attemptPair(manager.currentCode, 1000);
+  assert.equal(result.ok, true);
+  assert.equal(manager.revokeCurrentToken("Bearer not-a-real-token"), false);
+  assert.equal(manager.revokeCurrentToken(undefined), false);
+  assert.equal(manager.issuedTokenCount, 1);
+});
+
+test("revokeAllTokens: 複数端末分のトークンを一括で失効させ、以後すべて拒否される", () => {
+  const manager = new PairingManager(BASE_CONFIG, 1000, [
+    { tokenHash: hashTokenForTest("device-a"), issuedAt: 1 },
+    { tokenHash: hashTokenForTest("device-b"), issuedAt: 2 },
+  ]);
+  assert.equal(manager.verifyToken("Bearer device-a"), true);
+  assert.equal(manager.verifyToken("Bearer device-b"), true);
+
+  const revokedCount = manager.revokeAllTokens();
+  assert.equal(revokedCount, 2);
+  assert.equal(manager.verifyToken("Bearer device-a"), false);
+  assert.equal(manager.verifyToken("Bearer device-b"), false);
+  assert.equal(manager.issuedTokenCount, 0);
 });

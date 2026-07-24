@@ -99,7 +99,12 @@ async function withServer(
   fn: (started: StartedCompanion, baseUrl: string) => Promise<void>,
 ): Promise<void> {
   const tmpDir = overrides.tmpDir ?? (await makeTmpDir());
-  const started = await startServer({ allowInsecureHttp: true, port: 0, tmpDir, ...overrides });
+  // tokenStorePathを明示しないと既定値（実ホームディレクトリ配下）へ書き込んでしまうため、
+  // テストでは必ず使い捨てのディレクトリを指す。tmpDir配下には置かない
+  // （本番同様tmp/とpairing-tokens.jsonは別ディレクトリ＝tmpDirの「残存ファイル無し」検証を汚染しないため）。
+  const tokenDir = overrides.tokenStorePath ? null : await makeTmpDir();
+  const tokenStorePath = overrides.tokenStorePath ?? path.join(tokenDir as string, "pairing-tokens.json");
+  const started = await startServer({ allowInsecureHttp: true, port: 0, tmpDir, tokenStorePath, ...overrides });
   const address = started.server.address();
   const port = typeof address === "object" && address ? address.port : 0;
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -108,6 +113,7 @@ async function withServer(
   } finally {
     await started.close();
     await fs.rm(tmpDir, { recursive: true, force: true });
+    if (tokenDir) await fs.rm(tokenDir, { recursive: true, force: true });
   }
 }
 
@@ -255,6 +261,180 @@ test("POST /v1/pair: 失敗回数の上限を超えるとロックされる", as
   });
 });
 
+// ===========================================================
+// 信頼済み端末方式（永続ペアリング）: GET /v1/pair/status, POST /v1/pair/revoke, POST /v1/pair/revoke-all
+// ===========================================================
+
+test("GET /v1/pair/status: 有効なトークンなら200でpaired:trueを返す", async () => {
+  await withServer({}, async (started, baseUrl) => {
+    const token = await pairAndGetToken(baseUrl, started.pairing.currentCode);
+    const res = await fetch(`${baseUrl}/v1/pair/status`, {
+      headers: { Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    assert.equal(res.status, 200);
+    const body = await readJson<Record<string, unknown>>(res);
+    assert.equal(body.ok, true);
+    assert.equal(body.paired, true);
+  });
+});
+
+test("GET /v1/pair/status: トークンが無い・不正な場合は401（unauthorized。unpairフローを誘発する条件そのもの）", async () => {
+  await withServer({}, async (_started, baseUrl) => {
+    const noAuth = await fetch(`${baseUrl}/v1/pair/status`, { headers: { Origin: ALLOWED_ORIGIN } });
+    assert.equal(noAuth.status, 401);
+
+    const badAuth = await fetch(`${baseUrl}/v1/pair/status`, {
+      headers: { Origin: ALLOWED_ORIGIN, Authorization: "Bearer not-a-real-token" },
+    });
+    assert.equal(badAuth.status, 401);
+  });
+});
+
+test("GET /v1/pair/status: originが無い場合は403 forbidden_origin（unauthorizedとは区別される）", async () => {
+  await withServer({}, async (started, baseUrl) => {
+    const token = await pairAndGetToken(baseUrl, started.pairing.currentCode);
+    const res = await fetch(`${baseUrl}/v1/pair/status`, { headers: { Authorization: `Bearer ${token}` } });
+    assert.equal(res.status, 403);
+    const body = await readJson<Record<string, unknown>>(res);
+    assert.equal(body.error, "forbidden_origin");
+  });
+});
+
+test("POST /v1/pair/revoke: 自分のトークンを失効させると、以後statusも/v1/audioも401になる", async () => {
+  await withServer({}, async (started, baseUrl) => {
+    const token = await pairAndGetToken(baseUrl, started.pairing.currentCode);
+
+    const revokeRes = await fetch(`${baseUrl}/v1/pair/revoke`, {
+      method: "POST",
+      headers: { Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    assert.equal(revokeRes.status, 200);
+    const revokeBody = await readJson<Record<string, unknown>>(revokeRes);
+    assert.equal(revokeBody.ok, true);
+    assert.equal(revokeBody.revokedCount, 1);
+    assert.equal(revokeBody.persisted, true);
+
+    const statusRes = await fetch(`${baseUrl}/v1/pair/status`, {
+      headers: { Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    assert.equal(statusRes.status, 401);
+
+    const audioRes = await fetch(`${baseUrl}/v1/audio`, {
+      method: "POST",
+      headers: { "Content-Type": "audio/webm", Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${token}` },
+      body: new Uint8Array([1, 2, 3]),
+    });
+    assert.equal(audioRes.status, 401);
+  });
+});
+
+test("POST /v1/pair/revoke-all: 複数端末（複数トークン）分すべてが一括で失効する", async () => {
+  await withServer({}, async (started, baseUrl) => {
+    const tokenA = await pairAndGetToken(baseUrl, started.pairing.currentCode);
+    started.pairing.regenerate();
+    const tokenB = await pairAndGetToken(baseUrl, started.pairing.currentCode);
+
+    const revokeAllRes = await fetch(`${baseUrl}/v1/pair/revoke-all`, {
+      method: "POST",
+      headers: { Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${tokenA}` },
+    });
+    assert.equal(revokeAllRes.status, 200);
+    const revokeAllBody = await readJson<Record<string, unknown>>(revokeAllRes);
+    assert.equal(revokeAllBody.ok, true);
+    assert.equal(revokeAllBody.revokedCount, 2);
+    assert.equal(revokeAllBody.persisted, true);
+
+    for (const token of [tokenA, tokenB]) {
+      const res = await fetch(`${baseUrl}/v1/pair/status`, {
+        headers: { Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${token}` },
+      });
+      assert.equal(res.status, 401);
+    }
+  });
+});
+
+test("POST /v1/pair/revoke, /v1/pair/revoke-all: originが無い場合は403で処理されない", async () => {
+  await withServer({}, async (started, baseUrl) => {
+    const token = await pairAndGetToken(baseUrl, started.pairing.currentCode);
+    const res = await fetch(`${baseUrl}/v1/pair/revoke`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(res.status, 403);
+    // 拒否されているので、トークンは引き続き有効なままである
+    const statusRes = await fetch(`${baseUrl}/v1/pair/status`, {
+      headers: { Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    assert.equal(statusRes.status, 200);
+  });
+});
+
+// ===========================================================
+// 信頼済み端末方式: トークンハッシュの永続化・Companion再起動・破損時の安全なフォールバック
+// ===========================================================
+
+test("永続化: ペアリング成功時にtokenStorePathへハッシュのみが保存される（生トークンは書き込まれない）", async () => {
+  const tmpDir = await makeTmpDir();
+  const tokenDir = await makeTmpDir();
+  const tokenStorePath = path.join(tokenDir, "pairing-tokens.json");
+  await withServer({ tmpDir, tokenStorePath }, async (started, baseUrl) => {
+    const token = await pairAndGetToken(baseUrl, started.pairing.currentCode);
+    const raw = await fs.readFile(tokenStorePath, "utf8");
+    assert.doesNotMatch(raw, new RegExp(token));
+    const parsed = JSON.parse(raw) as { tokens: Array<{ tokenHash: string }> };
+    assert.equal(parsed.tokens.length, 1);
+    assert.match(parsed.tokens[0].tokenHash, /^[0-9a-f]{64}$/);
+  });
+  await fs.rm(tokenDir, { recursive: true, force: true });
+});
+
+test("再起動相当: 新しいstartServerインスタンスが永続化ファイルから復元し、既存トークンで認証が通る", async () => {
+  const tokenDir = await makeTmpDir();
+  const tokenStorePath = path.join(tokenDir, "pairing-tokens.json");
+  const tmpDir1 = await makeTmpDir();
+  let token = "";
+  await withServer({ tmpDir: tmpDir1, tokenStorePath }, async (started, baseUrl) => {
+    token = await pairAndGetToken(baseUrl, started.pairing.currentCode);
+  });
+
+  // 「新しいstartServerインスタンス」＝Companionプロセスの再起動を模擬する。
+  // 同じtokenStorePathを指すが、tmpDirは新規（＝完全な別プロセス起動と同等）。
+  const tmpDir2 = await makeTmpDir();
+  await withServer({ tmpDir: tmpDir2, tokenStorePath }, async (_started, baseUrl) => {
+    const res = await fetch(`${baseUrl}/v1/pair/status`, {
+      headers: { Origin: ALLOWED_ORIGIN, Authorization: `Bearer ${token}` },
+    });
+    assert.equal(res.status, 200, "Companion再起動後も、ブラウザ側の既存トークンで再ペアリングなしに認証が通る必要がある");
+  });
+  await fs.rm(tokenDir, { recursive: true, force: true });
+});
+
+test("再起動相当: Companionの停止（close）は永続化されたトークンストアを削除しない", async () => {
+  const tokenDir = await makeTmpDir();
+  const tokenStorePath = path.join(tokenDir, "pairing-tokens.json");
+  const tmpDir = await makeTmpDir();
+  await withServer({ tmpDir, tokenStorePath }, async (started, baseUrl) => {
+    await pairAndGetToken(baseUrl, started.pairing.currentCode);
+  });
+  // withServerがcloseした後でも、tokenStorePathは存在し続けている必要がある。
+  const stat = await fs.stat(tokenStorePath);
+  assert.ok(stat.isFile());
+  await fs.rm(tokenDir, { recursive: true, force: true });
+});
+
+test("再起動相当: 永続化ファイルが破損していても起動はクラッシュせず未ペアリング状態になる", async () => {
+  const tokenDir = await makeTmpDir();
+  const tokenStorePath = path.join(tokenDir, "pairing-tokens.json");
+  await fs.writeFile(tokenStorePath, "{ this is corrupted json", "utf8");
+  const tmpDir = await makeTmpDir();
+  await withServer({ tmpDir, tokenStorePath }, async (started, baseUrl) => {
+    assert.equal(started.pairing.issuedTokenCount, 0);
+    const res = await fetch(`${baseUrl}/v1/health`);
+    assert.equal(res.status, 200, "破損した永続化ファイルがあっても起動自体はクラッシュしない");
+  });
+  await fs.rm(tokenDir, { recursive: true, force: true });
+});
+
 test("POST /v1/audio: Authorizationが無いと401", async () => {
   await withServer({}, async (_started, baseUrl) => {
     const res = await fetch(`${baseUrl}/v1/audio`, {
@@ -380,7 +560,12 @@ test("起動時: tmpDirに残存していた一時ファイルは清掃される
 
 test("終了時: closeを呼ぶとtmpDir内の残存ファイルも清掃される", async () => {
   const tmpDir = await makeTmpDir();
-  const started = await startServer({ allowInsecureHttp: true, port: 0, tmpDir });
+  const started = await startServer({
+    allowInsecureHttp: true,
+    port: 0,
+    tmpDir,
+    tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
+  });
   try {
     // サーバー起動後に紛れ込んだファイル（想定外の残存物）を模擬する。
     await fs.writeFile(path.join(tmpDir, "unexpected.webm"), "data");
@@ -497,6 +682,7 @@ test("HTTPSサーバー起動: 有効な証明書・秘密鍵があれば起動�
     const started = await startServer({
       port: 0,
       tmpDir,
+      tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
       allowInsecureHttp: false,
       tlsCertPath: certPath,
       tlsKeyPath: keyPath,
@@ -529,7 +715,14 @@ test("HTTPS CORS: 本番originが許可される", async () => {
   const certDir = await makeTmpDir();
   try {
     const { certPath, keyPath, certPem } = generateTestCertificate(certDir);
-    const started = await startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath });
+    const started = await startServer({
+        port: 0,
+        tmpDir,
+        tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
+        allowInsecureHttp: false,
+        tlsCertPath: certPath,
+        tlsKeyPath: keyPath,
+      });
     try {
       const address = started.server.address();
       const port = typeof address === "object" && address ? address.port : 0;
@@ -551,7 +744,14 @@ test("HTTPS CORS: 未許可originは引き続き拒否される", async () => {
   const certDir = await makeTmpDir();
   try {
     const { certPath, keyPath, certPem } = generateTestCertificate(certDir);
-    const started = await startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath });
+    const started = await startServer({
+        port: 0,
+        tmpDir,
+        tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
+        allowInsecureHttp: false,
+        tlsCertPath: certPath,
+        tlsKeyPath: keyPath,
+      });
     try {
       const address = started.server.address();
       const port = typeof address === "object" && address ? address.port : 0;
@@ -573,7 +773,14 @@ test("PNA: 許可originがAccess-Control-Request-Private-Networkを送るとAcce
   const certDir = await makeTmpDir();
   try {
     const { certPath, keyPath, certPem } = generateTestCertificate(certDir);
-    const started = await startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath });
+    const started = await startServer({
+        port: 0,
+        tmpDir,
+        tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
+        allowInsecureHttp: false,
+        tlsCertPath: certPath,
+        tlsKeyPath: keyPath,
+      });
     try {
       const address = started.server.address();
       const port = typeof address === "object" && address ? address.port : 0;
@@ -601,7 +808,14 @@ test("PNA: 未許可originにはAccess-Control-Allow-Private-Networkを返さな
   const certDir = await makeTmpDir();
   try {
     const { certPath, keyPath, certPem } = generateTestCertificate(certDir);
-    const started = await startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath });
+    const started = await startServer({
+        port: 0,
+        tmpDir,
+        tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
+        allowInsecureHttp: false,
+        tlsCertPath: certPath,
+        tlsKeyPath: keyPath,
+      });
     try {
       const address = started.server.address();
       const port = typeof address === "object" && address ? address.port : 0;
@@ -630,7 +844,14 @@ test("HTTPS CORS: CALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSで追加したOrigin�
   try {
     const { certPath, keyPath, certPem } = generateTestCertificate(certDir);
     await withExtraAllowedOriginEnv(PREVIEW_ORIGIN, async () => {
-      const started = await startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath });
+      const started = await startServer({
+        port: 0,
+        tmpDir,
+        tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
+        allowInsecureHttp: false,
+        tlsCertPath: certPath,
+        tlsKeyPath: keyPath,
+      });
       try {
         assert.ok(started.config.allowedOrigins.includes(PREVIEW_ORIGIN));
         // 既存のDEV_ORIGINS・PRODUCTION_ORIGINは維持されたままである
@@ -668,7 +889,14 @@ test("HTTPS CORS: 追加Origin設定後も、不許可originは引き続き拒�
   try {
     const { certPath, keyPath, certPem } = generateTestCertificate(certDir);
     await withExtraAllowedOriginEnv(PREVIEW_ORIGIN, async () => {
-      const started = await startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath });
+      const started = await startServer({
+        port: 0,
+        tmpDir,
+        tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
+        allowInsecureHttp: false,
+        tlsCertPath: certPath,
+        tlsKeyPath: keyPath,
+      });
       try {
         const address = started.server.address();
         const port = typeof address === "object" && address ? address.port : 0;
@@ -692,7 +920,14 @@ test("PNA: 追加Origin設定時も、PNA許可は許可済みOriginだけに返
   try {
     const { certPath, keyPath, certPem } = generateTestCertificate(certDir);
     await withExtraAllowedOriginEnv(PREVIEW_ORIGIN, async () => {
-      const started = await startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath });
+      const started = await startServer({
+        port: 0,
+        tmpDir,
+        tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
+        allowInsecureHttp: false,
+        tlsCertPath: certPath,
+        tlsKeyPath: keyPath,
+      });
       try {
         const address = started.server.address();
         const port = typeof address === "object" && address ? address.port : 0;
@@ -737,7 +972,14 @@ test("HTTPS CORS: 不正なCALLFLOW_COMPANION_EXTRA_ALLOWED_ORIGINSが設定さ�
       // 証明書自体は有効（generateTestCertificateで生成）なので、拒否理由がTLSではなく
       // Origin検証（httpsのみ許可）であることをエラーメッセージで確認する。
       await assert.rejects(
-        startServer({ port: 0, tmpDir, allowInsecureHttp: false, tlsCertPath: certPath, tlsKeyPath: keyPath }),
+        startServer({
+        port: 0,
+        tmpDir,
+        tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
+        allowInsecureHttp: false,
+        tlsCertPath: certPath,
+        tlsKeyPath: keyPath,
+      }),
         /https/,
       );
     });

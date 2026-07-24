@@ -348,6 +348,29 @@ PR #5（`feature/local-call-recorder-codex` → `main`）のVercel Previewへ、
 
 ---
 
+## 9-8. 信頼済み端末方式（永続ペアリング）実装結果
+
+実施日: 2026-07-24
+
+Companion・Macの再起動ごとに6桁のペアリングコードを再入力する必要があった従来方式を、
+「同じMac・同じChrome・同じ本番Originであれば一度のペアリングで再起動をまたいで使える」
+信頼済み端末方式へ改修した。Mac側は生のBearerトークンを一切保存せず、SHA-256ハッシュのみを
+リポジトリ外（`~/Library/Application Support/CallFlow Companion/pairing-tokens.json`、
+権限0700/0600）へatomic writeで永続化する。ブラウザ画面の表示時に保存済みトークンを裏側で
+検証し、実際に`unauthorized`（401）が返った場合のみ再ペアリングを促す（Companion未起動時は
+「Companionが起動していません」に留め、再ペアリングは促さない）。「ペアリングを解除」は
+Mac側のトークンも失効させるようになり、「すべての端末とのペアリングを解除」も追加した。
+macOSログイン時にCompanionを自動起動するLaunchAgent（per-user、127.0.0.1:4318のみ、
+既存のHTTPS設定を維持）のインストール・状態確認・アンインストールスクリプトも追加した。
+既存の`npm run companion:start`/`stop`/`check`は変更していない。
+
+- 独立したセキュリティレビュー（Opus、新規インスタンス）: 実施済み。結果は
+  [docs/callflow-companion-persistent-pairing.md](./callflow-companion-persistent-pairing.md)を参照
+- 自動テスト322件（アプリ側150件＋Companion側172件）すべて成功
+- 詳細は[docs/callflow-companion-persistent-pairing.md](./callflow-companion-persistent-pairing.md)を参照
+
+---
+
 ## 10. 技術的リスク
 
 - ~~whisper.cppの精度・速度が実用に耐えるか未検証~~ → **解消（2026-07-22）**。Phase 3Aで実機ベンチマーク済み、詳細は[docs/callflow-transcription-phase3a.md](./callflow-transcription-phase3a.md)参照。

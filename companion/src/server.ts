@@ -10,6 +10,7 @@ import { pathToFileURL } from "node:url";
 import { loadConfig, canStartServer } from "./config.ts";
 import { ensureTmpDir, cleanupAllTempFiles, deleteTempFile } from "./temp-files.ts";
 import { PairingManager } from "./pairing.ts";
+import { loadTokenStore, saveTokenStore } from "./pairing-store.ts";
 import { isAuthorized } from "./auth.ts";
 import { corsHeadersFor, preflightHeadersFor, isOriginAllowed } from "./cors.ts";
 import { receiveAudioUpload } from "./audio-upload.ts";
@@ -67,6 +68,31 @@ const PAIR_FAILURE_MESSAGES: Record<PairFailureReason, string> = {
   too_many_attempts: "失敗回数が上限を超えました。Companionを再起動してください。",
   no_active_code: "有効なペアリングコードがありません。",
 };
+
+const PAIR_AUTH_FAILURE_STATUS = { unauthorized: 401, forbidden_origin: 403 } as const;
+
+const PAIR_AUTH_FAILURE_MESSAGES = {
+  unauthorized: "認証に失敗しました。ペアリングをやり直してください。",
+  forbidden_origin: "許可されていない送信元からのリクエストです。",
+} as const;
+
+/**
+ * トークンの永続化（保存済みハッシュ一覧の書き込み）に失敗しても、そのリクエスト自体の
+ * 成否には影響させない（今回のセッション内では引き続き利用できる。次回起動時に
+ * 再ペアリングが必要になるだけの、安全側の劣化に留める）。トークン値そのものはログに出さない。
+ * 戻り値は永続化に成功したかどうか。特にrevoke系エンドポイントでは、この結果を
+ * レスポンスのpersistedフィールドとして呼び出し側へ伝え、「失効したはずなのに再起動後に
+ * 復活する」事態をユーザーが把握できるようにする。
+ */
+async function persistPairingTokens(config: CompanionConfig, pairing: PairingManager): Promise<boolean> {
+  try {
+    await saveTokenStore(config.tokenStorePath, pairing.listStoredTokens());
+    return true;
+  } catch {
+    console.error("[callflow-companion] ペアリング情報の永続化に失敗しました");
+    return false;
+  }
+}
 
 const AUDIO_FAILURE_STATUS: Record<AudioUploadFailureReason, number> = {
   unauthorized: 401,
@@ -148,12 +174,59 @@ export function createRequestListener(
       const code = typeof (parsed as PairRequestBody | undefined)?.code === "string" ? (parsed as PairRequestBody).code : "";
       const result = pairing.attemptPair(code);
       if (result.ok) {
+        await persistPairingTokens(config, pairing);
         sendJson(res, 200, { ok: true, token: result.token, tokenType: "Bearer" }, cors);
         return;
       }
       const status = result.reason === "too_many_attempts" ? 429 : 401;
       sendJson(res, status, { ok: false, error: result.reason, message: PAIR_FAILURE_MESSAGES[result.reason] }, cors);
       return;
+    }
+
+    if (
+      pathname === "/v1/pair/status" ||
+      pathname === "/v1/pair/revoke" ||
+      pathname === "/v1/pair/revoke-all"
+    ) {
+      // これらは既存トークンを前提とするエンドポイントのため、/v1/audio・/v1/transcriptions等と
+      // 同様にOrigin未許可を最優先で拒否したうえで、Bearer認証を確認する。
+      if (!isOriginAllowed(origin, config.allowedOrigins)) {
+        sendJson(
+          res,
+          PAIR_AUTH_FAILURE_STATUS.forbidden_origin,
+          { ok: false, error: "forbidden_origin", message: PAIR_AUTH_FAILURE_MESSAGES.forbidden_origin },
+          {},
+        );
+        return;
+      }
+      if (!isAuthorized(pairing, req.headers.authorization)) {
+        sendJson(
+          res,
+          PAIR_AUTH_FAILURE_STATUS.unauthorized,
+          { ok: false, error: "unauthorized", message: PAIR_AUTH_FAILURE_MESSAGES.unauthorized },
+          cors,
+        );
+        return;
+      }
+
+      if (pathname === "/v1/pair/status" && req.method === "GET") {
+        sendJson(res, 200, { ok: true, paired: true }, cors);
+        return;
+      }
+
+      if (pathname === "/v1/pair/revoke" && req.method === "POST") {
+        const revoked = pairing.revokeCurrentToken(req.headers.authorization);
+        const persisted = await persistPairingTokens(config, pairing);
+        sendJson(res, 200, { ok: true, revokedCount: revoked ? 1 : 0, persisted }, cors);
+        return;
+      }
+
+      if (pathname === "/v1/pair/revoke-all" && req.method === "POST") {
+        const revokedCount = pairing.revokeAllTokens();
+        const persisted = await persistPairingTokens(config, pairing);
+        sendJson(res, 200, { ok: true, revokedCount, persisted }, cors);
+        return;
+      }
     }
 
     if (pathname === "/v1/audio" && req.method === "POST") {
@@ -267,7 +340,11 @@ export async function startServer(overrides: Partial<CompanionConfig> = {}): Pro
   await ensureTmpDir(config.tmpDir);
   await cleanupAllTempFiles(config.tmpDir);
 
-  const pairing = new PairingManager(config);
+  // 前回起動時に永続化されたペアリングトークンのハッシュを読み込む。
+  // ファイルが無い・壊れている場合は空配列（＝未ペアリング状態）にフォールバックする
+  // （loadTokenStoreは例外を投げないため、ここでも起動をクラッシュさせない）。
+  const persistedTokens = await loadTokenStore(config.tokenStorePath);
+  const pairing = new PairingManager(config, Date.now(), persistedTokens);
   const jobManager = new TranscriptionJobManager(config);
 
   const codexAppServer = new CodexAppServer(loadCodexAppServerConfig());
@@ -343,6 +420,7 @@ async function main(): Promise<void> {
   console.log(`[callflow-companion] モード: ${config.secure ? "HTTPS" : "HTTP（開発用・安全でない接続）"}`);
   console.log(`[callflow-companion] アドレス: ${config.secure ? "https" : "http"}://${config.host}:${config.port}`);
   console.log(`[callflow-companion] 許可オリジン: ${config.allowedOrigins.join(", ")}`);
+  console.log(`[callflow-companion] 復元済みの信頼済み端末: ${pairing.issuedTokenCount}件`);
   console.log(`[callflow-companion] ペアリングコード: ${pairing.currentCode}（有効期限: ${formatLocalTime(pairing.currentExpiresAt)}）`);
   if (!config.secure) {
     console.log("[callflow-companion] 警告: これは開発用の安全でない接続です。本番originからは接続できません。");
