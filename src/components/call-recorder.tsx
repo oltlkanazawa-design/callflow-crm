@@ -12,6 +12,7 @@ import {
 import {
   getCompanionBaseUrl, loadStoredToken, storeToken, clearStoredToken,
   checkCompanionHealth, pairWithCompanion, uploadRecordingToCompanion, generateRecordingId,
+  checkPairingStatus, revokePairing, revokeAllPairings, CompanionClientError,
   companionErrorMessage, type CompanionUploadResult,
   createTranscriptionJob, pollTranscriptionJob, cancelTranscriptionJob, type TranscriptionJobView,
   createAnalysisJob, pollAnalysisJob, cancelAnalysisJob, type AnalysisJobView, type CallAnalysisResult,
@@ -131,6 +132,10 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   // Companion（Mac上のローカル処理アプリ）連携用の状態
   // ---------------------------------------------------------
   const [companionToken, setCompanionToken] = useState<string | null>(() => (CALL_COMPANION_ENABLED ? loadStoredToken() : null));
+  // トークンがある間は楽観的に"connected"として表示し始める（画面表示の最初から「接続済み」を示すため）。
+  // マウント時の裏側の検証で無効化(401)と分かればトークンごと未接続へ、未到達（Companion未起動等）と
+  // 分かればこのフラグだけを"unreachable"にする（トークンは維持し、再ペアリングは促さない）。
+  const [companionConnectionStatus, setCompanionConnectionStatus] = useState<"connected" | "unreachable">("connected");
   const [companionChecking, setCompanionChecking] = useState(false);
   const [showPairingForm, setShowPairingForm] = useState(false);
   const [pairingCodeInput, setPairingCodeInput] = useState("");
@@ -495,12 +500,17 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     setPairingBusy(true);
     setPairingError(null);
     try {
-      const token = await pairWithCompanion(getCompanionBaseUrl(), pairingCodeInput);
+      const { token, persisted } = await pairWithCompanion(getCompanionBaseUrl(), pairingCodeInput);
       storeToken(token);
       setCompanionToken(token);
+      setCompanionConnectionStatus("connected");
       setShowPairingForm(false);
       setPairingCodeInput("");
-      notify("Macの処理アプリとペアリングしました");
+      if (persisted) {
+        notify("Macの処理アプリとペアリングしました");
+      } else {
+        notify("接続には成功しましたが、Mac側への保存に失敗しました。Companion再起動後に再ペアリングが必要になる可能性があります");
+      }
     } catch (error) {
       setPairingError(companionErrorMessage(error));
     } finally {
@@ -508,11 +518,63 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
     }
   };
 
-  const unpairCompanion = () => {
+  /** Companionが未到達状態から復帰したかどうかを、新しいペアリングコードなしに再確認する。 */
+  const recheckPairedConnection = async () => {
+    if (!companionToken) return;
+    setCompanionChecking(true);
+    try {
+      await checkPairingStatus(getCompanionBaseUrl(), companionToken);
+      setCompanionConnectionStatus("connected");
+      notify("Companionに再接続しました");
+    } catch (error) {
+      if (error instanceof CompanionClientError && error.code === "unauthorized") {
+        clearStoredToken();
+        setCompanionToken(null);
+        notify("ペアリングが無効になっています。もう一度ペアリングしてください");
+      } else {
+        notify(companionErrorMessage(error));
+      }
+    } finally {
+      setCompanionChecking(false);
+    }
+  };
+
+  const unpairCompanion = async () => {
+    const tokenToRevoke = companionToken;
     clearStoredToken();
     setCompanionToken(null);
+    setCompanionConnectionStatus("connected");
     setShowPairingForm(false);
     notify("Companionとのペアリングを解除しました");
+    if (!tokenToRevoke) return;
+    try {
+      // ベストエフォート。Companion側で失効させられなくても、ブラウザ側は既に未ペアリング状態にする。
+      const result = await revokePairing(getCompanionBaseUrl(), tokenToRevoke);
+      if (!result.persisted) {
+        notify("Mac側への保存に失敗しました。Companionを再起動すると再びペアリング済みに戻る可能性があります");
+      }
+    } catch {
+      // 無視する（Companion未起動時でも解除操作自体は完了させる）。
+    }
+  };
+
+  /** このトークンを含む、Companionに保存されているすべての端末のペアリングを一括で解除する。 */
+  const revokeAllCompanionPairings = async () => {
+    const tokenToRevoke = companionToken;
+    if (!tokenToRevoke) return;
+    clearStoredToken();
+    setCompanionToken(null);
+    setCompanionConnectionStatus("connected");
+    setShowPairingForm(false);
+    notify("すべての端末とのペアリングを解除しました");
+    try {
+      const result = await revokeAllPairings(getCompanionBaseUrl(), tokenToRevoke);
+      if (!result.persisted) {
+        notify("Mac側への保存に失敗しました。Companionを再起動すると再びペアリング済みに戻る可能性があります");
+      }
+    } catch {
+      // 無視する（ベストエフォート）。
+    }
   };
 
   const sendRecordingToCompanion = async () => {
@@ -771,6 +833,34 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   }, [state]);
 
   // ---------------------------------------------------------
+  // 自動接続: 画面表示時に保存済みトークンをCompanionへ検証する（信頼済み端末方式）。
+  // 実際にunauthorized（401）が返った場合のみ未ペアリング状態へ戻す。
+  // それ以外の失敗（Companion未起動・未到達など）ではトークンを維持したまま
+  // "unreachable"を示すのみとし、再ペアリングは一切促さない。
+  // ---------------------------------------------------------
+  useEffect(() => {
+    if (!CALL_COMPANION_ENABLED || !companionToken) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        await checkPairingStatus(getCompanionBaseUrl(), companionToken);
+      } catch (error) {
+        if (cancelled) return;
+        if (error instanceof CompanionClientError && error.code === "unauthorized") {
+          clearStoredToken();
+          setCompanionToken(null);
+        } else {
+          setCompanionConnectionStatus("unreachable");
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ---------------------------------------------------------
   // アンマウント時の後始末
   // ---------------------------------------------------------
   useEffect(() => {
@@ -832,14 +922,33 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
               )}
               {pairingError && <p className="mt-1.5 text-[10px] text-red-600">{pairingError}</p>}
             </>
+          ) : companionConnectionStatus === "unreachable" ? (
+            <div className="flex items-center justify-between gap-2">
+              <p className="flex items-center gap-1.5 text-[10px] font-bold text-amber-600">
+                <WifiOff size={12} />Companionが起動していません
+              </p>
+              <div className="flex items-center gap-2">
+                <button className="btn btn-light !py-1 text-[10px]" disabled={companionChecking} onClick={recheckPairedConnection}>
+                  {companionChecking ? "確認中…" : "再確認"}
+                </button>
+                <button className="text-[10px] font-bold text-slate-400 underline" onClick={unpairCompanion}>
+                  <Unplug size={11} className="mr-1 inline" />解除
+                </button>
+              </div>
+            </div>
           ) : (
             <div className="flex items-center justify-between">
               <p className="flex items-center gap-1.5 text-[10px] font-bold text-emerald-600">
                 <Wifi size={12} />Macの処理アプリ：接続済み
               </p>
-              <button className="text-[10px] font-bold text-slate-400 underline" onClick={unpairCompanion}>
-                <Unplug size={11} className="mr-1 inline" />ペアリングを解除
-              </button>
+              <div className="flex items-center gap-3">
+                <button className="text-[10px] font-bold text-slate-400 underline" onClick={unpairCompanion}>
+                  <Unplug size={11} className="mr-1 inline" />ペアリングを解除
+                </button>
+                <button className="text-[10px] font-bold text-slate-400 underline" onClick={revokeAllCompanionPairings}>
+                  すべての端末を解除
+                </button>
+              </div>
             </div>
           )}
         </div>

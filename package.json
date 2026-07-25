@@ -18,6 +18,9 @@
     "companion:start:dev": "bash scripts/start-callflow-companion-dev.sh",
     "companion:stop:dev": "bash scripts/stop-callflow-companion-dev.sh",
     "companion:check:dev": "bash scripts/check-callflow-companion-dev.sh",
+    "companion:launchagent:install": "bash scripts/install-callflow-companion-launchagent.sh",
+    "companion:launchagent:uninstall": "bash scripts/uninstall-callflow-companion-launchagent.sh",
+    "companion:launchagent:check": "bash scripts/check-callflow-companion-launchagent.sh",
     "transcription:setup": "bash scripts/setup-callflow-transcription.sh",
     "transcription:check": "bash scripts/check-callflow-transcription.sh",
     "transcription:benchmark": "bash scripts/benchmark-callflow-transcription.sh"

@@ -14,6 +14,8 @@ export interface CompanionConfig {
   pairingCodeTtlMs: number;
   pairingMaxAttempts: number;
   tokenLockoutOnLimit: boolean;
+  /** 永続化されたペアリングトークンハッシュの保存先（リポジトリ外）。生トークンは保存しない。 */
+  tokenStorePath: string;
 }
 
 export const SUPPORTED_AUDIO_MIME_TYPES = [
@@ -40,6 +42,9 @@ export interface PairSuccessResponseBody {
   ok: true;
   token: string;
   tokenType: "Bearer";
+  /** falseの場合、今回のセッションでは認証済みだが、Mac側への永続化に失敗している
+   * （＝Companion再起動後に再ペアリングが必要になる可能性がある）。 */
+  persisted: boolean;
 }
 
 export type PairFailureReason =
@@ -53,6 +58,32 @@ export type PairFailureReason =
 export interface PairFailureResponseBody {
   ok: false;
   error: PairFailureReason;
+  message: string;
+}
+
+/** GET /v1/pair/status: 保存済みトークンが今も有効かどうかを確認する（自動接続用）。 */
+export interface PairStatusResponseBody {
+  ok: true;
+  paired: true;
+}
+
+/**
+ * POST /v1/pair/revoke, POST /v1/pair/revoke-all の成功レスポンス。
+ * persistedがfalseの場合、失効自体はメモリ上で完了しているが永続化ファイルへの書き込みに
+ * 失敗している（＝Companionを再起動すると失効させたはずのトークンが復元されてしまう恐れが
+ * ある）ことを示す。呼び出し側はこの場合、ユーザーへ警告を出すことが望ましい。
+ */
+export interface PairRevokeResponseBody {
+  ok: true;
+  revokedCount: number;
+  persisted: boolean;
+}
+
+export type PairAuthFailureReason = "unauthorized" | "forbidden_origin";
+
+export interface PairAuthFailureResponseBody {
+  ok: false;
+  error: PairAuthFailureReason;
   message: string;
 }
 

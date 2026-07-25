@@ -50,7 +50,8 @@ async function withHarness(codexOverrides: Partial<FakeCodexConfig> = {}, overri
   process.env.CALLFLOW_CODEX_WORK_DIR = codexWorkDir;
   process.env.CALLFLOW_ANALYSIS_TURN_TIMEOUT_MS = "2000";
 
-  const started = await startServer({ allowInsecureHttp: true, port: 0, tmpDir, ...overrides });
+  const tokenStorePath = overrides.tokenStorePath ?? path.join(tmpDir, "pairing-tokens.json");
+  const started = await startServer({ allowInsecureHttp: true, port: 0, tmpDir, tokenStorePath, ...overrides });
   const address = started.server.address();
   const port = typeof address === "object" && address ? address.port : 0;
   const baseUrl = `http://127.0.0.1:${port}`;

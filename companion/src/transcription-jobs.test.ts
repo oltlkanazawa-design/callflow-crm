@@ -33,6 +33,7 @@ function fakeCompanionConfig(tmpDir: string): CompanionConfig {
     tlsCertPath: null,
     tlsKeyPath: null,
     tmpDir,
+    tokenStorePath: path.join(tmpDir, "pairing-tokens.json"),
     allowedOrigins: [],
     maxBodyBytes: 100 * 1024 * 1024,
     pairingCodeTtlMs: 5 * 60 * 1000,

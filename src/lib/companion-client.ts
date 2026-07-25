@@ -6,6 +6,7 @@ const TOKEN_STORAGE_KEY = "callflow_companion_token_v1";
 
 const DEFAULT_HEALTH_TIMEOUT_MS = 4000;
 const DEFAULT_PAIR_TIMEOUT_MS = 8000;
+const DEFAULT_PAIR_STATUS_TIMEOUT_MS = 4000;
 const DEFAULT_UPLOAD_TIMEOUT_MS = 120_000;
 
 export function getCompanionBaseUrl(): string {
@@ -311,7 +312,14 @@ export async function checkCompanionHealth(baseUrl: string, options: RequestOpti
 // ---------------------------------------------------------
 // Pairing
 // ---------------------------------------------------------
-export async function pairWithCompanion(baseUrl: string, code: string, options: RequestOptions = {}): Promise<string> {
+export interface CompanionPairResult {
+  token: string;
+  /** falseの場合、Mac側への永続化に失敗している（今回のセッションでは利用できるが、
+   * Companion再起動後に再ペアリングが必要になる可能性がある）。 */
+  persisted: boolean;
+}
+
+export async function pairWithCompanion(baseUrl: string, code: string, options: RequestOptions = {}): Promise<CompanionPairResult> {
   assertValidCompanionUrl(baseUrl);
   const res = await fetchWithTimeout(
     `${baseUrl}/v1/pair`,
@@ -326,8 +334,68 @@ export async function pairWithCompanion(baseUrl: string, code: string, options: 
   if (!res.ok) {
     throw await parseErrorResponse(res);
   }
-  const body = (await res.json()) as { ok: true; token: string };
-  return body.token;
+  const body = (await res.json()) as { ok: true; token: string; persisted: boolean };
+  return { token: body.token, persisted: body.persisted };
+}
+
+/**
+ * 保存済みトークンがCompanion側で今も有効かを確認する（自動接続用）。
+ * 成功時はtrueを返す。失敗時は例外を投げるので、呼び出し側はerror.codeで
+ * "unauthorized"（＝実際にトークンが無効。再ペアリングを促す）と、それ以外
+ * （network_error/timeoutなど＝Companion未起動・未到達。再ペアリングは促さない）を区別すること。
+ */
+export async function checkPairingStatus(baseUrl: string, token: string, options: RequestOptions = {}): Promise<boolean> {
+  assertValidCompanionUrl(baseUrl);
+  const res = await fetchWithTimeout(
+    `${baseUrl}/v1/pair/status`,
+    { method: "GET", headers: { Authorization: `Bearer ${token}` } },
+    options.timeoutMs ?? DEFAULT_PAIR_STATUS_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!res.ok) {
+    throw await parseErrorResponse(res);
+  }
+  const body = (await res.json()) as { ok: true; paired: true };
+  return body.paired;
+}
+
+export interface CompanionRevokeResult {
+  revokedCount: number;
+  /** falseの場合、失効自体は完了しているがMac側の永続化ファイルへの書き込みに失敗している
+   * （＝Companionを再起動すると失効させたはずのトークンが復元される恐れがある）。 */
+  persisted: boolean;
+}
+
+/** 現在のトークンだけをCompanion側で失効させる（「ペアリングを解除」用）。 */
+export async function revokePairing(baseUrl: string, token: string, options: RequestOptions = {}): Promise<CompanionRevokeResult> {
+  assertValidCompanionUrl(baseUrl);
+  const res = await fetchWithTimeout(
+    `${baseUrl}/v1/pair/revoke`,
+    { method: "POST", headers: { Authorization: `Bearer ${token}` } },
+    options.timeoutMs ?? DEFAULT_PAIR_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!res.ok) {
+    throw await parseErrorResponse(res);
+  }
+  const body = (await res.json()) as { ok: true; revokedCount: number; persisted: boolean };
+  return { revokedCount: body.revokedCount, persisted: body.persisted };
+}
+
+/** すべての端末のトークンをCompanion側で一括失効させる（「すべての端末とのペアリングを解除」用）。 */
+export async function revokeAllPairings(baseUrl: string, token: string, options: RequestOptions = {}): Promise<CompanionRevokeResult> {
+  assertValidCompanionUrl(baseUrl);
+  const res = await fetchWithTimeout(
+    `${baseUrl}/v1/pair/revoke-all`,
+    { method: "POST", headers: { Authorization: `Bearer ${token}` } },
+    options.timeoutMs ?? DEFAULT_PAIR_TIMEOUT_MS,
+    options.signal,
+  );
+  if (!res.ok) {
+    throw await parseErrorResponse(res);
+  }
+  const body = (await res.json()) as { ok: true; revokedCount: number; persisted: boolean };
+  return { revokedCount: body.revokedCount, persisted: body.persisted };
 }
 
 // ---------------------------------------------------------

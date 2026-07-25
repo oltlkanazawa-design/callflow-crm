@@ -40,9 +40,20 @@ export class PairingManager {
   private readonly tokens = new Map<string, IssuedToken>();
   private readonly config: Pick<CompanionConfig, "pairingCodeTtlMs" | "pairingMaxAttempts">;
 
-  constructor(config: Pick<CompanionConfig, "pairingCodeTtlMs" | "pairingMaxAttempts">, now: number = Date.now()) {
+  /**
+   * persistedTokensは、前回のCompanion起動時に永続化されたトークンハッシュ（生トークンは含まない）。
+   * 起動時にここへ渡すことで、Companion再起動後もブラウザ側の既存トークンがそのまま使い続けられる。
+   */
+  constructor(
+    config: Pick<CompanionConfig, "pairingCodeTtlMs" | "pairingMaxAttempts">,
+    now: number = Date.now(),
+    persistedTokens: readonly IssuedToken[] = [],
+  ) {
     this.config = config;
     this.session = createPairingSession(now, config.pairingCodeTtlMs);
+    for (const issued of persistedTokens) {
+      this.tokens.set(issued.tokenHash, issued);
+    }
   }
 
   get currentCode(): string {
@@ -102,6 +113,38 @@ export class PairingManager {
       }
     }
     return false;
+  }
+
+  /**
+   * Authorizationヘッダーが指すトークン1件だけを失効させる（ブラウザ側の「ペアリングを解除」用）。
+   * verifyTokenと同じタイミングセーフな比較で対象を探す。該当が見つかれば失効させtrueを返す。
+   */
+  revokeCurrentToken(authorizationHeader: string | undefined): boolean {
+    if (!authorizationHeader || !authorizationHeader.startsWith("Bearer ")) {
+      return false;
+    }
+    const token = authorizationHeader.slice("Bearer ".length).trim();
+    if (!token) return false;
+    const candidateHash = hashToken(token);
+    for (const key of this.tokens.keys()) {
+      if (timingSafeEqualHex(candidateHash, key)) {
+        this.tokens.delete(key);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /** すべての端末のトークンを一括で失効させる（「すべての端末とのペアリングを解除」用）。失効件数を返す。 */
+  revokeAllTokens(): number {
+    const count = this.tokens.size;
+    this.tokens.clear();
+    return count;
+  }
+
+  /** 永続化のため、現在有効なトークンハッシュ一覧を返す（生トークンは含まれない）。 */
+  listStoredTokens(): IssuedToken[] {
+    return [...this.tokens.values()];
   }
 
   get issuedTokenCount(): number {

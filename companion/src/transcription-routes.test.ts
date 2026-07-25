@@ -43,7 +43,8 @@ async function withHarness(overrides: Partial<CompanionConfig> = {}): Promise<Ha
   process.env.CALLFLOW_TRANSCRIPTION_MODEL_DIR = binDir;
   process.env.CALLFLOW_FAKE_CONTROL_DIR = controlDir;
 
-  const started = await startServer({ allowInsecureHttp: true, port: 0, tmpDir, ...overrides });
+  const tokenStorePath = overrides.tokenStorePath ?? path.join(tmpDir, "pairing-tokens.json");
+  const started = await startServer({ allowInsecureHttp: true, port: 0, tmpDir, tokenStorePath, ...overrides });
   const address = started.server.address();
   const port = typeof address === "object" && address ? address.port : 0;
   const baseUrl = `http://127.0.0.1:${port}`;

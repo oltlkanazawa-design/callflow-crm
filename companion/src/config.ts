@@ -109,6 +109,10 @@ export function defaultTmpDir(): string {
   return path.join(os.homedir(), "Library", "Application Support", "CallFlow Companion", "tmp");
 }
 
+export function defaultTokenStorePath(): string {
+  return path.join(os.homedir(), "Library", "Application Support", "CallFlow Companion", "pairing-tokens.json");
+}
+
 function certificatesDir(): string {
   return path.join(os.homedir(), "Library", "Application Support", "CallFlow Companion", "certificates");
 }
@@ -151,6 +155,8 @@ export function loadConfig(overrides: Partial<CompanionConfig> = {}): CompanionC
     tlsCertPath,
     tlsKeyPath,
     tmpDir: overrides.tmpDir ?? process.env.CALLFLOW_COMPANION_TMP_DIR ?? defaultTmpDir(),
+    tokenStorePath:
+      overrides.tokenStorePath ?? process.env.CALLFLOW_COMPANION_TOKEN_STORE_PATH ?? defaultTokenStorePath(),
     allowedOrigins,
     maxBodyBytes:
       overrides.maxBodyBytes ?? readIntEnv("CALLFLOW_COMPANION_MAX_BODY_BYTES", DEFAULT_MAX_BODY_BYTES),
