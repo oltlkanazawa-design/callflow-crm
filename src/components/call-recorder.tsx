@@ -6,6 +6,7 @@ import {
   transition, canStartTest, canStartRecording, canStopRecording, canChangeMicrophone, isLocked, hasPendingRecording,
   pickSupportedMimeType, formatElapsedTime, formatFileSize, buildRecordingFileName,
   isOverMaxDuration, isOverMaxSize, classifyVolumeLevel, isSameCompany,
+  isAnalysisAvailable, shouldShowTranscriptionUi, shouldShowAnalysisUi,
   TEST_RECORDING_MS, RECORDING_TIMESLICE_MS,
   type RecorderState,
 } from "@/lib/call-recorder";
@@ -79,6 +80,7 @@ function isRecorderSupported(): boolean {
 }
 
 const CALL_COMPANION_ENABLED = process.env.NEXT_PUBLIC_CALL_COMPANION_ENABLED === "true";
+const CALL_TRANSCRIPTION_ENABLED = process.env.NEXT_PUBLIC_CALL_TRANSCRIPTION_ENABLED === "true";
 
 const COMPANION_CONSENT_MESSAGE =
   "録音音声を、このMac上で動いているCallFlow Companionへ送信します。\n" +
@@ -613,6 +615,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   };
 
   const startTranscription = async () => {
+    if (!CALL_TRANSCRIPTION_ENABLED) return;
     if (!companionToken || !recordingBlobRef.current) return;
     if (!isSameCompany(recordingCompanyIdRef.current, companyId)) {
       notify("表示中の企業が録音時と異なるため、文字起こしできません");
@@ -677,6 +680,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   };
 
   const cancelTranscription = async () => {
+    if (!CALL_TRANSCRIPTION_ENABLED) return;
     const jobId = transcriptionJobIdRef.current;
     transcriptionAbortRef.current?.abort();
     transcriptionAbortRef.current = null;
@@ -704,6 +708,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   // 営業通話解析（Phase 4、Codex連携）
   // ---------------------------------------------------------
   const startAnalysis = async () => {
+    if (!isAnalysisAvailable(CALL_ANALYSIS_ENABLED, CALL_TRANSCRIPTION_ENABLED)) return;
     if (!companionToken || !transcriptionJobIdRef.current || transcriptionState !== "completed") return;
     if (!isSameCompany(recordingCompanyIdRef.current, companyId)) {
       notify("表示中の企業が録音・文字起こし時と異なるため、解析できません");
@@ -766,6 +771,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
   };
 
   const cancelAnalysis = async () => {
+    if (!isAnalysisAvailable(CALL_ANALYSIS_ENABLED, CALL_TRANSCRIPTION_ENABLED)) return;
     const jobId = analysisJobIdRef.current;
     analysisAbortRef.current?.abort();
     analysisAbortRef.current = null;
@@ -1107,7 +1113,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
             </div>
           )}
 
-          {CALL_COMPANION_ENABLED && companionToken && (
+          {shouldShowTranscriptionUi(CALL_COMPANION_ENABLED, CALL_TRANSCRIPTION_ENABLED, Boolean(companionToken)) && (
             <div className="mt-3 border-t border-slate-100 pt-3">
               {transcriptionState === "idle" && (
                 <button className="btn btn-light w-full text-xs" onClick={startTranscription}>
@@ -1167,7 +1173,7 @@ const CallRecorder = forwardRef<CallRecorderHandle, Props>(function CallRecorder
             </div>
           )}
 
-          {CALL_ANALYSIS_ENABLED && companionToken && transcriptionState === "completed" && (
+          {shouldShowAnalysisUi(CALL_ANALYSIS_ENABLED, CALL_TRANSCRIPTION_ENABLED, Boolean(companionToken), transcriptionState === "completed") && (
             <div className="mt-3 border-t border-slate-100 pt-3">
               {analysisState === "idle" && (
                 <button className="btn btn-ai w-full text-xs" onClick={startAnalysis}>

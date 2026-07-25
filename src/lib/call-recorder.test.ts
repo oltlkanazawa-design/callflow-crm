@@ -4,6 +4,7 @@ import {
   transition, canStartTest, canStartRecording, canStopRecording, canChangeMicrophone, isLocked, hasPendingRecording,
   pickSupportedMimeType, extensionForMimeType, formatElapsedTime, formatFileSize, buildRecordingFileName,
   isOverMaxDuration, isOverMaxSize, classifyVolumeLevel, isSameCompany,
+  isAnalysisAvailable, shouldShowTranscriptionUi, shouldShowAnalysisUi,
   MAX_RECORDING_MS, MAX_RECORDING_BYTES,
 } from "./call-recorder.ts";
 
@@ -161,4 +162,84 @@ test("hasPendingRecording: recordedのときだけ未破棄の録音ありと判
   assert.equal(hasPendingRecording("recorded"), true);
   assert.equal(hasPendingRecording("recording"), false);
   assert.equal(hasPendingRecording("ready"), false);
+});
+
+// ===========================================================
+// 文字起こし・解析のFeature flag（NEXT_PUBLIC_CALL_TRANSCRIPTION_ENABLED /
+// NEXT_PUBLIC_CALL_ANALYSIS_ENABLED）の組み合わせ判定。
+// 以下はいずれも「録音機能自体は有効（CALL_RECORDING_ENABLED=true、callflow-app.tsx側で
+// 制御されるため本ファイルの対象外）」「Companion連携は有効かつペアリング済み
+// （companionEnabled=true・hasCompanionToken=true）」を前提とする4パターン。
+// ===========================================================
+
+test("isAnalysisAvailable: 両flagがtrueのときだけ利用可能", () => {
+  assert.equal(isAnalysisAvailable(true, true), true);
+  assert.equal(isAnalysisAvailable(true, false), false);
+  assert.equal(isAnalysisAvailable(false, true), false);
+  assert.equal(isAnalysisAvailable(false, false), false);
+});
+
+test("shouldShowTranscriptionUi: companion有効・ペアリング済みでもtranscription flagがfalseなら非表示", () => {
+  assert.equal(shouldShowTranscriptionUi(true, false, true), false);
+});
+test("shouldShowTranscriptionUi: transcription flagがtrueでもcompanionが無効なら非表示", () => {
+  assert.equal(shouldShowTranscriptionUi(false, true, true), false);
+});
+test("shouldShowTranscriptionUi: transcription flagがtrueでも未ペアリングなら非表示", () => {
+  assert.equal(shouldShowTranscriptionUi(true, true, false), false);
+});
+test("shouldShowTranscriptionUi: すべて満たせば表示", () => {
+  assert.equal(shouldShowTranscriptionUi(true, true, true), true);
+});
+
+test("shouldShowAnalysisUi: 文字起こしが完了していなければanalysis flagがtrueでも非表示", () => {
+  assert.equal(shouldShowAnalysisUi(true, true, true, false), false);
+});
+test("shouldShowAnalysisUi: すべて満たせば表示", () => {
+  assert.equal(shouldShowAnalysisUi(true, true, true, true), true);
+});
+
+test("パターンA: recording=true, companion=true, transcription=false, analysis=false → 文字起こしUI・解析UIともに非表示", () => {
+  const companionEnabled = true;
+  const transcriptionEnabled = false;
+  const analysisEnabled = false;
+  const hasToken = true;
+
+  assert.equal(shouldShowTranscriptionUi(companionEnabled, transcriptionEnabled, hasToken), false);
+  assert.equal(shouldShowAnalysisUi(analysisEnabled, transcriptionEnabled, hasToken, true), false);
+});
+
+test("パターンB: recording=true, companion=true, transcription=true, analysis=false → 文字起こしUIは表示、解析UIは非表示", () => {
+  const companionEnabled = true;
+  const transcriptionEnabled = true;
+  const analysisEnabled = false;
+  const hasToken = true;
+
+  assert.equal(shouldShowTranscriptionUi(companionEnabled, transcriptionEnabled, hasToken), true);
+  assert.equal(shouldShowAnalysisUi(analysisEnabled, transcriptionEnabled, hasToken, true), false);
+});
+
+test("パターンC: recording=true, companion=true, transcription=true, analysis=true → 文字起こし完了後に解析UIが表示される", () => {
+  const companionEnabled = true;
+  const transcriptionEnabled = true;
+  const analysisEnabled = true;
+  const hasToken = true;
+
+  assert.equal(shouldShowTranscriptionUi(companionEnabled, transcriptionEnabled, hasToken), true);
+  // 文字起こしが完了する前は解析UIはまだ表示されない
+  assert.equal(shouldShowAnalysisUi(analysisEnabled, transcriptionEnabled, hasToken, false), false);
+  // 文字起こし完了後に解析UIが表示される
+  assert.equal(shouldShowAnalysisUi(analysisEnabled, transcriptionEnabled, hasToken, true), true);
+});
+
+test("パターンD: recording=true, companion=true, transcription=false, analysis=true → 文字起こしUI・解析UIともに非表示（analysis=trueでもtranscription=falseなら利用不可）", () => {
+  const companionEnabled = true;
+  const transcriptionEnabled = false;
+  const analysisEnabled = true;
+  const hasToken = true;
+
+  assert.equal(shouldShowTranscriptionUi(companionEnabled, transcriptionEnabled, hasToken), false);
+  assert.equal(shouldShowAnalysisUi(analysisEnabled, transcriptionEnabled, hasToken, true), false);
+  // 実行側ガード（startAnalysis/cancelAnalysis）が参照する判定：APIを呼んではいけない状態であること
+  assert.equal(isAnalysisAvailable(analysisEnabled, transcriptionEnabled), false);
 });

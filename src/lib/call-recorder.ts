@@ -163,3 +163,30 @@ export function classifyVolumeLevel(peakLevel: number): "ok" | "low" {
 export function isSameCompany(recordingCompanyId: string | null, currentCompanyId: string | undefined): boolean {
   return Boolean(recordingCompanyId) && recordingCompanyId === currentCompanyId;
 }
+
+// ---------------------------------------------------------
+// Feature flag（文字起こし・解析）の表示・実行可否判定
+// ---------------------------------------------------------
+/**
+ * 解析機能全体が有効かどうか。解析自体のflagに加え、前提となる文字起こしflagも
+ * 有効でなければならない（解析は文字起こし結果を入力とするため、文字起こしが
+ * 無効化されている環境では解析だけを有効にしても実行できない）。
+ */
+export function isAnalysisAvailable(analysisEnabled: boolean, transcriptionEnabled: boolean): boolean {
+  return analysisEnabled && transcriptionEnabled;
+}
+
+/** 文字起こしUI（開始ボタン・進行状況・結果・再実行・キャンセル・エラー表示）全体を表示してよいか。 */
+export function shouldShowTranscriptionUi(companionEnabled: boolean, transcriptionEnabled: boolean, hasCompanionToken: boolean): boolean {
+  return transcriptionEnabled && companionEnabled && hasCompanionToken;
+}
+
+/** 解析UI（開始ボタン等）を表示してよいか。文字起こしが完了している場合のみ。 */
+export function shouldShowAnalysisUi(
+  analysisEnabled: boolean,
+  transcriptionEnabled: boolean,
+  hasCompanionToken: boolean,
+  transcriptionCompleted: boolean,
+): boolean {
+  return isAnalysisAvailable(analysisEnabled, transcriptionEnabled) && hasCompanionToken && transcriptionCompleted;
+}
