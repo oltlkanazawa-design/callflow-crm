@@ -43,4 +43,7 @@ export CALLFLOW_COMPANION_TMP_DIR="$TMP_DIR"
 # 通常のシェルから直接この起動スクリプトを試す場合はPATH上のnodeにフォールバックする。
 NODE_BIN="${CALLFLOW_COMPANION_NODE_BIN:-node}"
 
+# CALLFLOW_CODEX_BINARY_PATH（インストール時にplistのEnvironmentVariablesへ焼き込まれている場合）は
+# ここで明示的にexportしなくても、launchdが設定したプロセス環境として既に引き継がれており、
+# execでnodeへ置き換わった後もそのまま子プロセスへ渡る。
 exec "$NODE_BIN" companion/src/server.ts
