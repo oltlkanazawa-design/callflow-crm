@@ -10,6 +10,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+# shellcheck source=./resolve-callflow-codex-binary-path.sh
+. "$SCRIPT_DIR/resolve-callflow-codex-binary-path.sh"
 
 APP_SUPPORT_DIR="$HOME/Library/Application Support/CallFlow Companion"
 CERT_DIR="$APP_SUPPORT_DIR/certificates"
@@ -38,6 +40,21 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 echo "CallFlow CompanionをHTTPSモードで起動します（127.0.0.1:4318のみ）..."
+
+# Codex CLIの絶対パスを解決する（見つからなくてもCompanion自体（録音・文字起こし）は起動する。
+# Codex解析だけが利用できなくなり、実行時にcodex_unavailableとして扱われる）。
+RESOLVED_CODEX_BIN="$(resolve_callflow_codex_binary_path || true)"
+if [ -n "$RESOLVED_CODEX_BIN" ]; then
+  export CALLFLOW_CODEX_BINARY_PATH="$RESOLVED_CODEX_BIN"
+else
+  # 呼び出し元シェルが既に（無効な値の）CALLFLOW_CODEX_BINARY_PATHをexport済みだった場合に備えて
+  # 明示的に取り消す。そのまま残すと、node側の既定値"codex"へのフォールバックより優先されてしまい、
+  # 無効なパスでspawnを試みてしまう。
+  unset CALLFLOW_CODEX_BINARY_PATH 2>/dev/null || true
+  echo "警告: Codex CLI（codexコマンド）が見つかりませんでした。録音・文字起こし機能は利用できますが、" >&2
+  echo "Codexによる営業内容解析は利用できません。インストール済みの場合はPATHが通っているか確認するか、" >&2
+  echo "環境変数 CALLFLOW_CODEX_BINARY_PATH で絶対パスを明示してください。" >&2
+fi
 
 cd "$REPO_ROOT"
 CALLFLOW_COMPANION_TLS_CERT_PATH="$CERT_FILE" \

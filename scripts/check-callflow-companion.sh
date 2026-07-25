@@ -1,6 +1,12 @@
 #!/bin/bash
 # CallFlow Companion（HTTPSモード）の起動状態を確認する。秘密情報は一切表示しない。
+# Codex CLIの絶対パス・バージョンは、ローカルの管理者向け確認コマンドとしてここでのみ表示する
+# （ブラウザ・Vercelなど外部へは一切送信しない）。
 set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=./resolve-callflow-codex-binary-path.sh
+. "$SCRIPT_DIR/resolve-callflow-codex-binary-path.sh"
 
 APP_SUPPORT_DIR="$HOME/Library/Application Support/CallFlow Companion"
 PID_FILE="$APP_SUPPORT_DIR/companion.pid"
@@ -27,6 +33,16 @@ if [ -f "$CERT_FILE" ]; then
   openssl x509 -in "$CERT_FILE" -noout -dates 2>/dev/null || echo "証明書の読み取りに失敗しました"
 else
   echo "証明書: 見つかりません（npm run companion:setup-tls を実行してください）"
+fi
+
+echo ""
+echo "--- Codex CLI（営業内容解析に使用） ---"
+RESOLVED_CODEX_BIN="$(resolve_callflow_codex_binary_path || true)"
+if [ -n "$RESOLVED_CODEX_BIN" ]; then
+  CODEX_VERSION="$("$RESOLVED_CODEX_BIN" --version 2>/dev/null || echo "取得できませんでした")"
+  echo "検出済み: $RESOLVED_CODEX_BIN（バージョン: $CODEX_VERSION）"
+else
+  echo "見つかりません（Codexによる営業内容解析は利用できません。録音・文字起こしは利用できます）"
 fi
 
 echo ""
