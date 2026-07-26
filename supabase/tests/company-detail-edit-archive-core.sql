@@ -396,6 +396,27 @@ begin
 end $$;
 reset role;
 
+\echo '=== T20: companies_with_call_statusビューの列名・順序が、companies物理列順（新規schema.sql環境／本番のemail後付け環境のいずれでも）に関わらず統一されている ==='
+do $$
+declare
+  v_expected text[] := array[
+    'id','organization_id','name','industry','location','phone','website_url',
+    'source_url','list_source','contact_name','contact_department','heat',
+    'owner_id','memo','last_called_at','next_action_at','created_at','updated_at',
+    'email','call_prohibited','blocklist_id','blocked_scope','blocked_reason',
+    'archived_at','archived_by','updated_by'
+  ];
+  v_actual text[];
+begin
+  select array_agg(column_name order by ordinal_position) into v_actual
+    from information_schema.columns
+    where table_schema='public' and table_name='companies_with_call_status';
+  if v_actual is distinct from v_expected then
+    raise exception 'FAIL[T20]: companies_with_call_statusの列名・順序が想定と異なります（実際=%、期待=%）', v_actual, v_expected;
+  end if;
+  raise notice 'PASS[T20]: companies_with_call_statusの列名・順序は、companiesの物理列順に依存せず統一されている（emailの実際の位置に関わらずidenticalなビュー列順）';
+end $$;
+
 \echo '=== ALL COMPANY-DETAIL-EDIT-ARCHIVE ASSERTIONS EXECUTED ==='
 
 rollback;

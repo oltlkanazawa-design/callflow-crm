@@ -247,6 +247,95 @@ jobs:
           chmod +x supabase/tests/company-safety-concurrency.sh
           supabase/tests/company-safety-concurrency.sh "$DB_URL"
 
+      - name: "Reset DB (clean baseline for Scenario E: production-history path)"
+        env:
+          SANDBOX_DIR: ${{ runner.temp }}/supabase-ci-sandbox
+        run: |
+          set -euo pipefail
+          cd "$SANDBOX_DIR"
+          supabase db reset
+
+      - name: "Scenario E: reproduce production history (email added via ALTER TABLE before company-safety), then apply add-company-detail-edit-archive.sql"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          # companies_with_call_statusは`select c.*, ...`という定義のため、companiesの
+          # 物理列順序に依存する。本番ではemailをadd-company-email-column.sql（ALTER TABLE
+          # ADD COLUMN）で後から追加したため、実際の物理列順は末尾がemail。一方、新規
+          # schema.sqlのCREATE TABLE文ではemailを読みやすい位置に書いているため、Scenario A
+          # （schema.sqlのみ適用）ではこの食い違いを検出できない。この経路は、本番と同じ
+          # 履歴（email列なしで作成→後からALTER TABLEで追加→企業安全管理を適用）を
+          # 再現したうえでadd-company-detail-edit-archive.sqlを適用し、column順序に依存する
+          # 不具合（実際に本番で発見されたもの）を確実に検出する。
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/fixtures/ci-privileges-setup.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/fixtures/base-schema-pre-email-column.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/add-company-email-column.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/add-company-safety-stage-a.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/add-company-detail-edit-archive.sql
+
+      - name: "Scenario E: run multi-org regression + core logic tests + detail/edit/archive tests (production-history path)"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-multi-org.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-core.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-detail-edit-archive-core.sql
+
+      - name: "Scenario E: rollback add-company-detail-edit-archive.sql and verify objects/columns are removed"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/rollback-company-detail-edit-archive.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          do $$
+          begin
+            if to_regprocedure('public.archive_company(uuid)') is not null then
+              raise exception 'FAIL: archive_company still exists after rollback';
+            end if;
+            if to_regprocedure('public.restore_company(uuid)') is not null then
+              raise exception 'FAIL: restore_company still exists after rollback';
+            end if;
+            if exists (
+              select 1 from information_schema.columns
+              where table_schema='public' and table_name='companies'
+                and column_name in ('archived_at','archived_by','updated_by')
+            ) then
+              raise exception 'FAIL: archived_at/archived_by/updated_by still exist on companies after rollback';
+            end if;
+            if to_regclass('public.companies_with_call_status') is null then
+              raise exception 'FAIL: companies_with_call_status view missing after rollback';
+            end if;
+            if exists (
+              select 1 from information_schema.columns
+              where table_schema='public' and table_name='companies_with_call_status'
+                and column_name in ('archived_at','archived_by','updated_by')
+            ) then
+              raise exception 'FAIL: companies_with_call_status still exposes archived_at/archived_by/updated_by after rollback';
+            end if;
+            raise notice 'PASS: rollback removed archive_company/restore_company and the 3 new columns, and companies_with_call_status no longer exposes them';
+          end $$;
+          do $$
+          declare v_companies_count int; v_call_logs_count int;
+          begin
+            select count(*) into v_companies_count from public.companies;
+            select count(*) into v_call_logs_count from public.call_logs;
+            raise notice 'PASS: post-rollback row counts intact (companies=%, call_logs=%)', v_companies_count, v_call_logs_count;
+          end $$;
+          SQL
+
+      - name: "Scenario E: re-apply add-company-detail-edit-archive.sql after rollback and re-run tests (production-history path)"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/add-company-detail-edit-archive.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-multi-org.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-core.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-detail-edit-archive-core.sql
+
       - name: Stop Supabase sandbox
         if: always()
         env:

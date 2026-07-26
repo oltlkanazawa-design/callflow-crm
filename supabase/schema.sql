@@ -2029,22 +2029,32 @@ grant execute on function public.check_company_safety(text,text,text,text) to au
 --    【重要な訂正】このビューは `select c.*, ...` という定義だが、`c.*` は
 --    ビュー作成時点で実列名の一覧へ展開され、ビュー定義（pg_rewrite）に
 --    固定される。companiesへ後から列を追加しても、ビュー側は自動的には
---    反映されない（`create or replace view` などでビューを明示的に
---    作り直さない限り、新しい列はSELECT結果に現れない）。
---    そのため、このマイグレーションのcompaniesへのADD COLUMNだけでは
---    companies_with_call_status経由（本番のloadCRMData()が使う経路）で
---    archived_at等を取得できず、フロントエンドは常にarchived_atが
---    無い状態として企業を扱ってしまう（アーカイブ機能が実質的に機能しない）。
+--    反映されない（ビューを明示的に作り直さない限り、新しい列はSELECT結果に
+--    現れない）。そのため、このマイグレーションのcompaniesへのADD COLUMNだけ
+--    では companies_with_call_status経由（本番のloadCRMData()が使う経路）で
+--    archived_at等を取得できず、フロントエンドは常にarchived_atが無い状態
+--    として企業を扱ってしまう（アーカイブ機能が実質的に機能しない）。
 --
---    `create or replace view` は「既存の列は同じ名前・同じ順序・同じ型で
---    残し、新しい列は末尾にしか追加できない」という制約があるため、
---    `c.*` を使い続けたまま新しい列を追加すると、companies側で新しく
---    増えた列（archived_at等）がcall_prohibited等より前に挿入されてしまい、
---    既存列の並びが変わってREPLACEに失敗する。これを避けるため、companies
---    由来の列は `c.*` ではなく、元のビュー定義時点の列を明示的に同じ順序で
---    列挙し、archived_at/archived_by/updated_byは列挙の一番最後に追加する。
+--    【重要：CREATE OR REPLACE VIEWを使わない理由】
+--    本番環境と、schema.sqlだけで作る新規環境とでは、companies.emailの
+--    物理的な列順序が異なる。本番ではemailを add-company-email-column.sql
+--    （ALTER TABLE ADD COLUMN email）で後から追加したため、実際の物理列順は
+--    …, updated_at, email（一番最後）。一方、新規プロジェクト用schema.sqlの
+--    CREATE TABLE文ではemailをlist_sourceの直後に読みやすく記述しているため、
+--    新規環境ではemailがその位置に来る。CREATE OR REPLACE VIEWは「既存の列は
+--    同じ名前・同じ順序・同じ型のまま残し、新しい列は末尾にしか追加できない」
+--    という制約があるため、どちらか一方の環境に列順を合わせて固定してしまうと、
+--    もう一方の環境でREPLACEが失敗する（本番実機で実際に検証し、本番の物理列
+--    順は「…, updated_at, email」であることを確認済み）。
+--    そのため、CREATE OR REPLACE VIEWではなく、まずビューを一旦DROPしてから
+--    （CASCADEは使わない。事前にpg_depend等で依存オブジェクトが無いことを
+--    本番で確認済み）、列順の制約を受けないCREATE VIEWで明示的な列挙により
+--    作り直す。列順は「本番の実際の物理列順」を正とし、archived_at/
+--    archived_by/updated_byは列挙の一番最後に追加する。
 -- ---------------------------------------------------------
-create or replace view public.companies_with_call_status
+drop view if exists public.companies_with_call_status;
+
+create view public.companies_with_call_status
 with (
   security_barrier = true,
   security_invoker = true
@@ -2052,8 +2062,9 @@ with (
 as
 select
   c.id, c.organization_id, c.name, c.industry, c.location, c.phone, c.website_url,
-  c.source_url, c.list_source, c.email, c.contact_name, c.contact_department, c.heat,
+  c.source_url, c.list_source, c.contact_name, c.contact_department, c.heat,
   c.owner_id, c.memo, c.last_called_at, c.next_action_at, c.created_at, c.updated_at,
+  c.email,
   (m.blocklist_id is not null) as call_prohibited,
   m.blocklist_id,
   m.matched_scope as blocked_scope,
