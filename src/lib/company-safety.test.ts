@@ -53,6 +53,11 @@ test("companySafetyErrorMessage: 企業詳細・編集・アーカイブ管理�
   assert.equal(companySafetyErrorMessage("company_id_required"), "対象の企業を指定してください");
 });
 
+test("companySafetyErrorMessage: 一括アーカイブの新しいエラーコードを日本語へ変換する", () => {
+  assert.equal(companySafetyErrorMessage("company_ids_required"), "対象の企業を1件以上選択してください");
+  assert.equal(companySafetyErrorMessage("too_many_company_ids"), "一度にアーカイブできるのは500件までです。件数を減らして再度お試しください");
+});
+
 test("matchScopeLabel: 既知のスコープを日本語ラベルへ変換する", () => {
   assert.equal(matchScopeLabel("phone"), "電話番号が一致");
   assert.equal(matchScopeLabel("domain"), "公式URLのドメインが一致");

@@ -3,7 +3,8 @@ import { demoCompanies, demoLogs, demoMembers } from "./demo-data";
 import { memberErrorMessage, filterActivePendingInvitations } from "./members";
 import { normalizePhone, urlDomain, normalizeName } from "./csv-import";
 import { companySafetyErrorMessage } from "./company-safety";
-import type { OnDuplicate, MatchScope, CheckCompanySafetyResult, CheckedWriteResult, CreateCompaniesCheckedResult, BulkRowResult, BlocklistEntry, ArchiveCompanyResult, RestoreCompanyResult } from "./company-safety";
+import type { OnDuplicate, MatchScope, CheckCompanySafetyResult, CheckedWriteResult, CreateCompaniesCheckedResult, BulkRowResult, BlocklistEntry, ArchiveCompanyResult, RestoreCompanyResult, BulkArchiveCompaniesResult } from "./company-safety";
+import { dedupeCompanyIds, MAX_BULK_ARCHIVE_IDS } from "./bulk-archive";
 import type { CallLog, Company, Heat, Member, MemberInvitation, MemberRole } from "./types";
 
 const COMPANY_KEY = "callflow_companies_v1";
@@ -610,6 +611,39 @@ export async function restoreCompany(companyId: string): Promise<RestoreCompanyR
   const { data, error } = await supabase.rpc("restore_company", { p_company_id: companyId });
   if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
   return data as RestoreCompanyResult;
+}
+
+// 管理者専用（UI側で管理者以外にはチェックボックス・一括操作自体を表示しない）。
+// ブラウザからarchive_company()を何十回も連続実行するのではなく、専用RPCで
+// 1トランザクションにまとめる。空配列・上限件数はサーバー側（archive_companies）と
+// 同じ規則をクライアント側でも先に検証し、無駄なラウンドトリップを避ける
+// （最終的な安全性の担保はサーバー側のRPCが行う）。
+export async function archiveCompanies(companyIds: string[]): Promise<BulkArchiveCompaniesResult> {
+  const dedupIds = dedupeCompanyIds(companyIds);
+  if (dedupIds.length === 0) throw new Error(companySafetyErrorMessage("company_ids_required"));
+  if (dedupIds.length > MAX_BULK_ARCHIVE_IDS) throw new Error(companySafetyErrorMessage("too_many_company_ids"));
+
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const companies = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+    const targets = companies.filter(c => dedupIds.includes(c.id));
+    if (targets.length !== dedupIds.length) throw new Error(companySafetyErrorMessage("company_not_found_in_your_organization"));
+    const now = new Date().toISOString();
+    let archivedCount = 0, alreadyArchivedCount = 0;
+    const archivedIds: string[] = [];
+    const updated = companies.map(c => {
+      if (!dedupIds.includes(c.id)) return c;
+      if (c.archived_at) { alreadyArchivedCount++; return c; }
+      archivedCount++; archivedIds.push(c.id);
+      return { ...c, archived_at: now };
+    });
+    localStorage.setItem(COMPANY_KEY, JSON.stringify(updated));
+    return { status: "archived", requested_count: dedupIds.length, archived_count: archivedCount, already_archived_count: alreadyArchivedCount, archived_company_ids: archivedIds };
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("archive_companies", { p_company_ids: dedupIds });
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
+  return data as BulkArchiveCompaniesResult;
 }
 
 export interface CompanyCallLogPage {
