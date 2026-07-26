@@ -50,6 +50,16 @@ export type CheckedWriteResult =
   | { status: "needs_explicit_update"; existing_company_id: string }
   | { status: "needs_explicit_resolution"; conflicting_company_id: string };
 
+// archive_company / restore_company が返すjsonbのstatus判別
+export type ArchiveCompanyResult =
+  | { status: "archived"; company: Record<string, unknown> }
+  | { status: "already_archived"; company: Record<string, unknown> };
+
+export type RestoreCompanyResult =
+  | { status: "restored"; company: Record<string, unknown> }
+  | { status: "already_active"; company: Record<string, unknown> }
+  | { status: "duplicate_conflict"; conflicting_company_id: string };
+
 // 行エラーには管理された安全なerror_codeだけを含める。Postgresの生メッセージ
 // （制約名・テーブル名・SQL・データ型を含みうる）は一切含めない
 export interface BulkRowResult {
@@ -94,6 +104,10 @@ const ERROR_MESSAGES: Record<string, string> = {
   invalid_value: "入力値の形式が正しくありません",
   value_too_long: "入力値が長すぎます",
   row_save_failed: "この行の保存に失敗しました",
+  invalid_heat: "温度感の指定が正しくありません",
+  owner_must_be_active_org_member: "担当メンバーは、同じ組織の有効なメンバーから選択してください",
+  company_is_archived: "この企業はアーカイブ済みのため編集できません。先に復元してください",
+  company_id_required: "対象の企業を指定してください",
   "company not found": "対象の企業が見つかりません",
   "invalid result": "架電結果の指定が正しくありません",
   "invalid heat": "温度感の指定が正しくありません",

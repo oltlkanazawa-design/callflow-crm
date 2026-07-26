@@ -110,6 +110,7 @@ jobs:
           set -euo pipefail
           psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-multi-org.sql
           psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-core.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-detail-edit-archive-core.sql
 
       - name: Reset DB (clean baseline for Scenario B)
         env:
