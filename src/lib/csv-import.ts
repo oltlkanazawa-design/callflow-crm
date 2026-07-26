@@ -29,6 +29,18 @@ const HEADER_ALIASES: Record<CanonicalField, string[]> = {
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const URL_HOST_PATTERN = /^([\w-]+\.)+[\w-]{2,}(\/.*)?$/i;
 
+// 企業編集フォーム等、CSV取り込み以外の入力チェックでも同じ正規表現を再利用するための公開関数。
+// 空文字列は「未入力」として妥当とみなす（必須チェックは呼び出し側の責務）。
+export function isValidEmailFormat(email: string): boolean {
+  return !email || EMAIL_PATTERN.test(email);
+}
+export function isValidUrlFormat(url: string): boolean {
+  return !url || URL_HOST_PATTERN.test(url.replace(/^https?:\/\//i, ""));
+}
+export function isValidPhoneFormat(phone: string): boolean {
+  return !phone || normalizePhone(phone).length >= 9;
+}
+
 export interface CsvRowResult {
   rowIndex: number;
   raw: string[];

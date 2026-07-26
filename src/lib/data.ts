@@ -3,8 +3,8 @@ import { demoCompanies, demoLogs, demoMembers } from "./demo-data";
 import { memberErrorMessage, filterActivePendingInvitations } from "./members";
 import { normalizePhone, urlDomain, normalizeName } from "./csv-import";
 import { companySafetyErrorMessage } from "./company-safety";
-import type { OnDuplicate, MatchScope, CheckCompanySafetyResult, CheckedWriteResult, CreateCompaniesCheckedResult, BulkRowResult, BlocklistEntry } from "./company-safety";
-import type { CallLog, Company, Member, MemberInvitation, MemberRole } from "./types";
+import type { OnDuplicate, MatchScope, CheckCompanySafetyResult, CheckedWriteResult, CreateCompaniesCheckedResult, BulkRowResult, BlocklistEntry, ArchiveCompanyResult, RestoreCompanyResult } from "./company-safety";
+import type { CallLog, Company, Heat, Member, MemberInvitation, MemberRole } from "./types";
 
 const COMPANY_KEY = "callflow_companies_v1";
 const LOG_KEY = "callflow_logs_v1";
@@ -478,4 +478,175 @@ export async function unblockCompanyCalls(blocklistId: string, reason: string): 
   const { data, error } = await supabase.rpc("unblock_company_calls", { p_blocklist_id: blocklistId, p_reason: reason });
   if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
   return data as BlocklistEntry;
+}
+
+// ===========================================================
+// 企業詳細・編集・アーカイブ管理
+// ===========================================================
+
+export interface CompanyUpdateInput {
+  name?: string; phone?: string; website_url?: string; location?: string;
+  industry?: string; contact_name?: string; contact_department?: string;
+  email?: string; memo?: string; list_source?: string; source_url?: string;
+  heat?: Heat; owner_id?: string | null; next_action_at?: string | null;
+}
+
+// update_company_checked()と同じ規約：キー自体が無ければ「変更しない」、
+// キーが空文字列／nullなら「空欄にする」。呼び出し側（企業編集フォーム）は
+// 変更するフィールドだけをpatchに含めること。
+export async function updateCompanyChecked(companyId: string, patch: CompanyUpdateInput, onDuplicate: OnDuplicate = "skip"): Promise<CheckedWriteResult> {
+  if (!VALID_ON_DUPLICATE.includes(onDuplicate)) throw new Error(companySafetyErrorMessage("invalid_on_duplicate"));
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const companies = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+    const target = companies.find(c => c.id === companyId);
+    if (!target) throw new Error(companySafetyErrorMessage("company_not_found_in_your_organization"));
+    if (target.archived_at) throw new Error(companySafetyErrorMessage("company_is_archived"));
+
+    const newName = (patch.name ?? "").trim() || target.name;
+    const newPhone = (patch.phone ?? "").trim() || target.phone;
+    const newWebsiteUrl = patch.website_url !== undefined ? patch.website_url : target.website_url;
+    const newLocation = (patch.location ?? "").trim() || target.location;
+    if (!newName.trim()) throw new Error(companySafetyErrorMessage("name_required"));
+
+    if (patch.heat !== undefined && !["高", "中", "低"].includes(patch.heat)) {
+      throw new Error(companySafetyErrorMessage("invalid_heat"));
+    }
+
+    let newOwnerId = target.owner_id;
+    let newOwnerName = target.owner_name;
+    if ("owner_id" in patch) {
+      const ownerId = patch.owner_id || null;
+      if (ownerId) {
+        const members = readLocal<Member[]>(MEMBER_KEY, demoMembers);
+        const ownerMember = members.find(m => m.id === ownerId && m.active);
+        if (!ownerMember) throw new Error(companySafetyErrorMessage("owner_must_be_active_org_member"));
+        newOwnerId = ownerId;
+        newOwnerName = ownerMember.full_name;
+      } else {
+        newOwnerId = undefined;
+        newOwnerName = "未割当";
+      }
+    }
+
+    // 禁止判定用のドメインだけは、name/phone/locationと同じく「パッチが空欄なら既存値を
+    // 維持」した値から算出する（禁止されていない企業が正当にURLを削除できるよう、
+    // 書き込み値自体（newWebsiteUrl）は空欄を許すが、空欄化による禁止回避は防ぐ）。
+    const blockCheckWebsiteUrl = patch.website_url ? patch.website_url : target.website_url;
+    const blockCheckKeys = normalizeCompanyKeys({ name: newName, phone: newPhone, website_url: blockCheckWebsiteUrl, location: newLocation });
+    const block = matchDemoBlocklist(readBlocklist(), blockCheckKeys);
+    if (block) return { status: "blocked", blocklist_id: block.id, matched_scope: block.match_scope, reason: block.reason };
+
+    const keys = normalizeCompanyKeys({ name: newName, phone: newPhone, website_url: newWebsiteUrl, location: newLocation });
+    // アーカイブ済み企業は重複判定の対象から除外する（アーカイブによってそのキーは再利用可能になる）
+    const activeOthers = companies.filter(c => c.id !== companyId && !c.archived_at);
+    const dup = findDemoDuplicate(activeOthers, keys);
+    if (dup && onDuplicate === "skip") return { status: "skipped", conflicting_company_id: dup.id };
+    if (dup && onDuplicate !== "insert") return { status: "needs_explicit_resolution", conflicting_company_id: dup.id };
+
+    const updated: Company = {
+      ...target,
+      name: newName, phone: newPhone, website_url: newWebsiteUrl || undefined, location: newLocation,
+      industry: patch.industry !== undefined ? patch.industry : target.industry,
+      contact_name: patch.contact_name !== undefined ? patch.contact_name : target.contact_name,
+      contact_department: patch.contact_department !== undefined ? patch.contact_department : target.contact_department,
+      email: patch.email !== undefined ? patch.email : target.email,
+      memo: patch.memo !== undefined ? patch.memo : target.memo,
+      list_source: patch.list_source !== undefined ? patch.list_source : target.list_source,
+      source_url: patch.source_url !== undefined ? patch.source_url : target.source_url,
+      heat: patch.heat !== undefined ? patch.heat : target.heat,
+      owner_id: newOwnerId, owner_name: newOwnerName,
+      next_action_at: "next_action_at" in patch ? (patch.next_action_at || undefined) : target.next_action_at,
+      updated_at: new Date().toISOString(),
+    };
+    localStorage.setItem(COMPANY_KEY, JSON.stringify(companies.map(c => c.id === companyId ? updated : c)));
+    return { status: "updated", company: updated as unknown as Record<string, unknown> };
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("update_company_checked", { p_company_id: companyId, p_patch: patch, p_on_duplicate: onDuplicate });
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
+  return data as CheckedWriteResult;
+}
+
+// 管理者専用（UI側で管理者以外にはボタン自体を表示しない。block_company_calls等の
+// 既存の管理者専用アクションと同じ、デモモードでのUI側ゲーティング方針に合わせる）。
+// ハードDELETEしない。call_logs・call_blocklistは一切変更しない。
+export async function archiveCompany(companyId: string): Promise<ArchiveCompanyResult> {
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const companies = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+    const target = companies.find(c => c.id === companyId);
+    if (!target) throw new Error(companySafetyErrorMessage("company_not_found_in_your_organization"));
+    if (target.archived_at) return { status: "already_archived", company: target as unknown as Record<string, unknown> };
+    const updated: Company = { ...target, archived_at: new Date().toISOString() };
+    localStorage.setItem(COMPANY_KEY, JSON.stringify(companies.map(c => c.id === companyId ? updated : c)));
+    return { status: "archived", company: updated as unknown as Record<string, unknown> };
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("archive_company", { p_company_id: companyId });
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
+  return data as ArchiveCompanyResult;
+}
+
+// 管理者専用。復元前に、現在有効な他企業との重複衝突を必ず確認する
+// （衝突時はduplicate_conflictを返し、サイレントにマージしない）。
+// 架電禁止（call_blocklist）状態は復元をブロックしない。
+export async function restoreCompany(companyId: string): Promise<RestoreCompanyResult> {
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const companies = readLocal<Company[]>(COMPANY_KEY, demoCompanies);
+    const target = companies.find(c => c.id === companyId);
+    if (!target) throw new Error(companySafetyErrorMessage("company_not_found_in_your_organization"));
+    if (!target.archived_at) return { status: "already_active", company: target as unknown as Record<string, unknown> };
+    const keys = normalizeCompanyKeys(target);
+    const activeOthers = companies.filter(c => c.id !== companyId && !c.archived_at);
+    const dup = findDemoDuplicate(activeOthers, keys);
+    if (dup) return { status: "duplicate_conflict", conflicting_company_id: dup.id };
+    const updated: Company = { ...target, archived_at: null, archived_by: null };
+    localStorage.setItem(COMPANY_KEY, JSON.stringify(companies.map(c => c.id === companyId ? updated : c)));
+    return { status: "restored", company: updated as unknown as Record<string, unknown> };
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase.rpc("restore_company", { p_company_id: companyId });
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
+  return data as RestoreCompanyResult;
+}
+
+export interface CompanyCallLogPage {
+  logs: CallLog[];
+  hasMore: boolean;
+}
+
+export const COMPANY_CALL_LOG_PAGE_SIZE = 50;
+
+// loadCRMData()のcall_logsは組織全体で最新500件に制限されているため、
+// 特定企業の全履歴を見るにはこの専用クエリを使う（そのキャップの影響を受けない）。
+// company_idで絞り込み、RLS（organization_id = current_organization_id()）により
+// 他組織の行が混ざることはない。アーカイブ済み企業でも変わらず取得できる。
+export async function loadCompanyCallLogs(companyId: string, offset = 0, limit: number = COMPANY_CALL_LOG_PAGE_SIZE): Promise<CompanyCallLogPage> {
+  if (!isSupabaseConfigured) {
+    if (!isDemoModeAllowed) throw new Error("本番環境のデータベース接続が未設定です");
+    const all = readLocal<CallLog[]>(LOG_KEY, demoLogs)
+      .filter(l => l.company_id === companyId)
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    const page = all.slice(offset, offset + limit);
+    return { logs: page, hasMore: offset + limit < all.length };
+  }
+  const supabase = createClient();
+  const { data, error } = await supabase
+    .from("call_logs")
+    .select("*, companies(name), profiles!call_logs_caller_id_fkey(full_name)")
+    .eq("company_id", companyId)
+    .order("created_at", { ascending: false })
+    .range(offset, offset + limit); // limit+1件取得してhasMoreを判定する（count集計を避ける）
+  if (error) throw new Error(companySafetyErrorMessage(error.message, error.code));
+  const rows = data || [];
+  const hasMore = rows.length > limit;
+  const pageRows = hasMore ? rows.slice(0, limit) : rows;
+  const logs = pageRows.map((l: Record<string, unknown>) => ({
+    ...l,
+    company_name: (l.companies as { name?: string } | null)?.name || "削除済み",
+    caller_name: (l.profiles as { full_name?: string } | null)?.full_name || "不明",
+  })) as CallLog[];
+  return { logs, hasMore };
 }

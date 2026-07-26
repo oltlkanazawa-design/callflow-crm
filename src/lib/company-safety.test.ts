@@ -46,6 +46,13 @@ test("companySafetyErrorMessage: コードが既知のエラーメッセージ�
   assert.match(companySafetyErrorMessage("could not serialize access due to concurrent update", "40001"), /再度お試しください/);
 });
 
+test("companySafetyErrorMessage: 企業詳細・編集・アーカイブ管理の新しいエラーコードを日本語へ変換する", () => {
+  assert.equal(companySafetyErrorMessage("invalid_heat"), "温度感の指定が正しくありません");
+  assert.equal(companySafetyErrorMessage("owner_must_be_active_org_member"), "担当メンバーは、同じ組織の有効なメンバーから選択してください");
+  assert.equal(companySafetyErrorMessage("company_is_archived"), "この企業はアーカイブ済みのため編集できません。先に復元してください");
+  assert.equal(companySafetyErrorMessage("company_id_required"), "対象の企業を指定してください");
+});
+
 test("matchScopeLabel: 既知のスコープを日本語ラベルへ変換する", () => {
   assert.equal(matchScopeLabel("phone"), "電話番号が一致");
   assert.equal(matchScopeLabel("domain"), "公式URLのドメインが一致");

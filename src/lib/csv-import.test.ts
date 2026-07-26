@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   parseCsvText, detectDelimiter, autoDetectMapping, buildRows, summarizeRows,
   decodeCsvFile, normalizePhone, urlDomain, normalizeName, toHalfWidthDigits,
+  isValidEmailFormat, isValidUrlFormat, isValidPhoneFormat,
 } from "./csv-import.ts";
 import type { Company } from "./types.ts";
 
@@ -300,5 +301,26 @@ test("大量データ(1000件)でも件数・重複判定が正しく成立す�
   assert.equal(summary.total, 1000);
   assert.equal(summary.validCount, 1000);
   assert.equal(summary.duplicateCount, 0);
+});
+
+test("isValidEmailFormat: 空文字列は未入力として妥当、形式が正しいメールは妥当、それ以外は不正", () => {
+  assert.equal(isValidEmailFormat(""), true);
+  assert.equal(isValidEmailFormat("contact@example.com"), true);
+  assert.equal(isValidEmailFormat("invalid-email"), false);
+  assert.equal(isValidEmailFormat("missing-domain@"), false);
+});
+
+test("isValidUrlFormat: 空文字列は未入力として妥当、http(s)有無どちらも妥当なホスト形式を判定する", () => {
+  assert.equal(isValidUrlFormat(""), true);
+  assert.equal(isValidUrlFormat("https://example.com"), true);
+  assert.equal(isValidUrlFormat("example.com/path"), true);
+  assert.equal(isValidUrlFormat("not a url"), false);
+});
+
+test("isValidPhoneFormat: 空文字列は未入力として妥当、正規化後9桁未満は不正", () => {
+  assert.equal(isValidPhoneFormat(""), true);
+  assert.equal(isValidPhoneFormat("076-123-4567"), true);
+  assert.equal(isValidPhoneFormat("03-1234-5678"), true);
+  assert.equal(isValidPhoneFormat("12-34"), false);
 });
 

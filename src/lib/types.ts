@@ -22,6 +22,11 @@ export interface Company {
   last_called_at?: string;
   next_action_at?: string;
   created_at?: string;
+  updated_at?: string;
+  updated_by?: string | null;
+  // null/undefined＝有効な企業。値がある場合はアーカイブ済み
+  archived_at?: string | null;
+  archived_by?: string | null;
   // companies_with_call_status ビュー由来。デモモードでは常にfalse/undefined
   call_prohibited?: boolean;
   blocklist_id?: string | null;
