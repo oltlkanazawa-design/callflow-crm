@@ -1324,6 +1324,7 @@ end;
 $$;
 
 
+
 -- =========================================================
 -- 企業詳細・編集・アーカイブ管理
 -- 以下は supabase/add-company-detail-edit-archive.sql と同内容です。
@@ -2022,9 +2023,50 @@ revoke all on function public.check_company_safety(text,text,text,text) from pub
 grant execute on function public.check_company_safety(text,text,text,text) to authenticated;
 
 -- ---------------------------------------------------------
--- 備考：companies_with_call_status ビューへの変更は不要
---    このビューは `select c.*, ...` という定義であるため、companiesへの
---    新規列追加（archived_at / archived_by / updated_by）は、ビュー定義を
---    一切編集しなくても自動的に反映される。security_barrier / security_invoker
---    の設定もそのまま維持されるため、組織を越えたデータ漏洩のリスクは生じない。
+-- 24. companies_with_call_status ビューへ archived_at/archived_by/updated_by を追加
+--    （既存オブジェクトの変更）。
+--
+--    【重要な訂正】このビューは `select c.*, ...` という定義だが、`c.*` は
+--    ビュー作成時点で実列名の一覧へ展開され、ビュー定義（pg_rewrite）に
+--    固定される。companiesへ後から列を追加しても、ビュー側は自動的には
+--    反映されない（`create or replace view` などでビューを明示的に
+--    作り直さない限り、新しい列はSELECT結果に現れない）。
+--    そのため、このマイグレーションのcompaniesへのADD COLUMNだけでは
+--    companies_with_call_status経由（本番のloadCRMData()が使う経路）で
+--    archived_at等を取得できず、フロントエンドは常にarchived_atが
+--    無い状態として企業を扱ってしまう（アーカイブ機能が実質的に機能しない）。
+--
+--    `create or replace view` は「既存の列は同じ名前・同じ順序・同じ型で
+--    残し、新しい列は末尾にしか追加できない」という制約があるため、
+--    `c.*` を使い続けたまま新しい列を追加すると、companies側で新しく
+--    増えた列（archived_at等）がcall_prohibited等より前に挿入されてしまい、
+--    既存列の並びが変わってREPLACEに失敗する。これを避けるため、companies
+--    由来の列は `c.*` ではなく、元のビュー定義時点の列を明示的に同じ順序で
+--    列挙し、archived_at/archived_by/updated_byは列挙の一番最後に追加する。
 -- ---------------------------------------------------------
+create or replace view public.companies_with_call_status
+with (
+  security_barrier = true,
+  security_invoker = true
+)
+as
+select
+  c.id, c.organization_id, c.name, c.industry, c.location, c.phone, c.website_url,
+  c.source_url, c.list_source, c.email, c.contact_name, c.contact_department, c.heat,
+  c.owner_id, c.memo, c.last_called_at, c.next_action_at, c.created_at, c.updated_at,
+  (m.blocklist_id is not null) as call_prohibited,
+  m.blocklist_id,
+  m.matched_scope as blocked_scope,
+  m.reason as blocked_reason,
+  c.archived_at, c.archived_by, c.updated_by
+from public.companies c
+left join lateral public.match_active_blocklist(
+  c.organization_id,
+  public.normalize_phone(c.phone),
+  public.normalize_domain(c.website_url),
+  public.normalize_company_name(c.name),
+  public.normalize_location(c.location)
+) m on true;
+
+revoke all on public.companies_with_call_status from public, anon, authenticated;
+grant select on public.companies_with_call_status to authenticated;

@@ -455,7 +455,19 @@ $$;
 revoke all on function public.check_company_safety(text,text,text,text) from public, anon, authenticated;
 grant execute on function public.check_company_safety(text,text,text,text) to authenticated;
 
--- 5. companiesの新規列を削除する（archived_at/archived_by列にデータがある場合は
+-- 5. companies_with_call_status ビューを一旦削除する。
+--    現在のビュー定義はcompanies由来の列を明示的に列挙しており
+--    （archived_at/archived_by/updated_byを含む）、この状態のまま列を
+--    DROPしようとすると依存関係エラーになる。
+--    【注意】CREATE OR REPLACE VIEWは列を追加方向にしか使えず、列数を減らす
+--    リプレースは "cannot drop columns from view" エラーで失敗するため使えない。
+--    また、companiesがまだarchived_at等を持ったまま`c.*`でビューを作り直すと
+--    その時点の`c.*`に再びarchived_at等が含まれてしまい、直後のDROP COLUMNが
+--    同じ依存関係エラーで失敗する。そのため、ここでは一旦ビューを完全に削除し、
+--    列を削除した後（手順7）で`c.*`ベースの元の定義として作り直す（手順8）。
+drop view if exists public.companies_with_call_status;
+
+-- 6. companiesの新規列を削除する（archived_at/archived_by列にデータがある場合は
 --    「どの企業がアーカイブ済みか」の情報が失われる。上記の注意書きを参照）
 alter table public.companies
   drop column if exists archived_at,
@@ -463,5 +475,32 @@ alter table public.companies
   drop column if exists updated_by;
 
 drop index if exists public.companies_archived_idx;
+
+-- 7. companies_with_call_status ビューを、archived_at等を含まない元の定義
+--    （`c.*`。この時点でcompaniesは既にarchived_at等を持たないため、`c.*`は
+--    自然に元の19列だけへ展開される）で作り直す。
+create view public.companies_with_call_status
+with (
+  security_barrier = true,
+  security_invoker = true
+)
+as
+select
+  c.*,
+  (m.blocklist_id is not null) as call_prohibited,
+  m.blocklist_id,
+  m.matched_scope as blocked_scope,
+  m.reason as blocked_reason
+from public.companies c
+left join lateral public.match_active_blocklist(
+  c.organization_id,
+  public.normalize_phone(c.phone),
+  public.normalize_domain(c.website_url),
+  public.normalize_company_name(c.name),
+  public.normalize_location(c.location)
+) m on true;
+
+revoke all on public.companies_with_call_status from public, anon, authenticated;
+grant select on public.companies_with_call_status to authenticated;
 
 commit;
