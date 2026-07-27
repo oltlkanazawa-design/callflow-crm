@@ -60,6 +60,15 @@ export type RestoreCompanyResult =
   | { status: "already_active"; company: Record<string, unknown> }
   | { status: "duplicate_conflict"; conflicting_company_id: string };
 
+// archive_companies（複数企業の一括アーカイブ）が返すjsonb
+export interface BulkArchiveCompaniesResult {
+  status: "archived";
+  requested_count: number;
+  archived_count: number;
+  already_archived_count: number;
+  archived_company_ids: string[];
+}
+
 // 行エラーには管理された安全なerror_codeだけを含める。Postgresの生メッセージ
 // （制約名・テーブル名・SQL・データ型を含みうる）は一切含めない
 export interface BulkRowResult {
@@ -108,6 +117,8 @@ const ERROR_MESSAGES: Record<string, string> = {
   owner_must_be_active_org_member: "担当メンバーは、同じ組織の有効なメンバーから選択してください",
   company_is_archived: "この企業はアーカイブ済みのため編集できません。先に復元してください",
   company_id_required: "対象の企業を指定してください",
+  company_ids_required: "対象の企業を1件以上選択してください",
+  too_many_company_ids: "一度にアーカイブできるのは500件までです。件数を減らして再度お試しください",
   "company not found": "対象の企業が見つかりません",
   "invalid result": "架電結果の指定が正しくありません",
   "invalid heat": "温度感の指定が正しくありません",

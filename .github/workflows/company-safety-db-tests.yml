@@ -336,6 +336,68 @@ jobs:
           psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-core.sql
           psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-detail-edit-archive-core.sql
 
+      - name: "Reset DB (clean baseline for Scenario F: bulk company archive)"
+        env:
+          SANDBOX_DIR: ${{ runner.temp }}/supabase-ci-sandbox
+        run: |
+          set -euo pipefail
+          cd "$SANDBOX_DIR"
+          supabase db reset
+
+      - name: "Scenario F: apply schema.sql (new-project path, includes bulk company archive)"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/fixtures/ci-privileges-setup.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/schema.sql
+
+      - name: "Scenario F: run multi-org regression + core logic + detail/edit/archive + bulk archive tests"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-multi-org.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-core.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-detail-edit-archive-core.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/bulk-company-archive-core.sql
+
+      - name: "Scenario F: rollback add-bulk-company-archive.sql and verify the function is removed"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/rollback-bulk-company-archive.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          do $$
+          begin
+            if to_regprocedure('public.archive_companies(uuid[])') is not null then
+              raise exception 'FAIL: archive_companies still exists after rollback';
+            end if;
+            if to_regprocedure('public.archive_company(uuid)') is null then
+              raise exception 'FAIL: unrelated archive_company was removed by the bulk-archive rollback';
+            end if;
+            raise notice 'PASS: rollback removed archive_companies without touching archive_company';
+          end $$;
+          do $$
+          declare v_companies_count int;
+          begin
+            select count(*) into v_companies_count from public.companies;
+            raise notice 'PASS: post-rollback companies row count intact (companies=%)', v_companies_count;
+          end $$;
+          SQL
+
+      - name: "Scenario F: re-apply add-bulk-company-archive.sql after rollback and re-run tests"
+        env:
+          DB_URL: ${{ steps.dbinfo.outputs.db_url }}
+        run: |
+          set -euo pipefail
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/add-bulk-company-archive.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-multi-org.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-safety-core.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/company-detail-edit-archive-core.sql
+          psql "$DB_URL" -v ON_ERROR_STOP=1 -f supabase/tests/bulk-company-archive-core.sql
+
       - name: Stop Supabase sandbox
         if: always()
         env:

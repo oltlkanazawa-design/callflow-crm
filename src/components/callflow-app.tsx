@@ -5,7 +5,7 @@ import { Archive, ArchiveRestore, Building2, ChevronRight, ExternalLink, History
 import {
   loadCRMData, saveCallLog, createCompanyChecked, createCompaniesChecked, blockCompanyCalls, unblockCompanyCalls,
   inviteMember, cancelInvitation, setMemberActive, setMemberRole,
-  updateCompanyChecked, archiveCompany, restoreCompany, loadCompanyCallLogs, COMPANY_CALL_LOG_PAGE_SIZE,
+  updateCompanyChecked, archiveCompany, restoreCompany, archiveCompanies, loadCompanyCallLogs, COMPANY_CALL_LOG_PAGE_SIZE,
 } from "@/lib/data";
 import type { BulkRowInput, CompanyUpdateInput, CompanyCallLogPage } from "@/lib/data";
 import { isSupabaseConfigured, createClient } from "@/lib/supabase/client";
@@ -27,6 +27,7 @@ import {
 import type { MemberListRow } from "@/lib/members";
 import { splitAnalysisDateTime, combineDateTime } from "@/lib/analysis-datetime";
 import { isCompanyArchived, filterCompaniesByArchiveState } from "@/lib/company-archive";
+import { buildBulkArchivePreview, bulkArchiveResultMessage } from "@/lib/bulk-archive";
 
 type View = "dashboard" | "call" | "companies" | "history" | "team";
 const results: { value: CallResult; label: string }[] = [
@@ -147,7 +148,7 @@ export default function CallFlowApp() {
       <header className="flex min-h-[76px] items-center justify-between gap-3 px-4 md:px-8"><div className="flex items-center gap-3"><button className="lg:hidden" onClick={()=>setMenu(true)}><Menu/></button><div><h1 className="text-xl font-extrabold tracking-tight md:text-2xl">{meta[view][0]}</h1><p className="mt-1 hidden text-xs text-slate-500 sm:block">{meta[view][1]}</p></div></div><div className="flex gap-2"><select className="input hidden !w-auto md:block" value={viewFilterMemberId} onChange={e=>setViewFilterMemberId(e.target.value)} aria-label="担当者で絞り込み"><option value="all">全員</option>{activeMemberOptions(allMembers).map(m=><option key={m.id} value={m.id}>{m.full_name}</option>)}</select><button className="btn btn-ai" onClick={()=>setAiModal(true)}><Sparkles size={15}/><span className="hidden sm:inline">文字起こし解析</span></button></div></header>
       <div className="px-4 pb-10 md:px-8">{loading?<Loading/>:<>
         {view==="dashboard"&&<Dashboard companies={filteredCompanies} logs={filteredLogs} go={go}/>}
-        {view==="companies"&&<Companies companies={filteredCompanies} callCompany={callCompany} add={()=>setCompanyModal(true)} bulkImport={()=>setImportModal(true)} csvImport={()=>setCsvModal(true)} isAdmin={isAdmin} toggleBlock={c=>setBlockModal(c)} openDetail={guardedOpenDetail}/>}
+        {view==="companies"&&<Companies companies={filteredCompanies} callCompany={callCompany} add={()=>setCompanyModal(true)} bulkImport={()=>setImportModal(true)} csvImport={()=>setCsvModal(true)} isAdmin={isAdmin} toggleBlock={c=>setBlockModal(c)} openDetail={guardedOpenDetail} recordingLock={recordingLock} refresh={refresh} notify={notify}/>}
         {view==="call"&&<CallScreen company={callableCompanies[callIndex]} hasBlockedRemaining={callableCompanies.length===0&&filteredCompanies.length>0} member={currentUserName} next={guardedNext} onSaved={refresh} notify={notify} recordingEnabled={CALL_RECORDING_ENABLED} recordingLocked={recordingLock.isRecording} onRecordingLockChange={setRecordingLock} recorderRef={recorderRef}/>}
         {view==="history"&&<HistoryView logs={filteredLogs}/>}
         {view==="team"&&<Team logs={filteredLogs} allMembers={allMembers} pendingInvitations={pendingInvitations} viewFilterMemberId={viewFilterMemberId} currentUserId={currentUserId} isAdmin={isAdmin} notify={notify} refresh={refresh}/>}
@@ -175,10 +176,28 @@ function Dashboard({companies,logs,go}:{companies:Company[];logs:CallLog[];go:(v
 function ActivityChart({logs}:{logs:CallLog[]}){const formatter=new Intl.DateTimeFormat("sv-SE",{timeZone:"Asia/Tokyo"});const data=Array.from({length:7},(_,i)=>{const date=new Date();date.setDate(date.getDate()-(6-i));const key=formatter.format(date),items=logs.filter(l=>formatter.format(new Date(l.created_at))===key);return [new Intl.DateTimeFormat("ja-JP",{weekday:"short",timeZone:"Asia/Tokyo"}).format(date),items.length,items.filter(l=>l.result!=="担当者不在").length] as const});const max=Math.max(1,...data.map(x=>x[1]));return <><div className="flex h-[215px] items-end gap-2 border-b border-slate-200 bg-[repeating-linear-gradient(to_top,#fff_0,#fff_42px,#f1f4f8_43px)] px-2">{data.map(([d,a,b],i)=><div className="relative flex h-full flex-1 items-end gap-1" key={`${d}-${i}`}><i className="flex-1 rounded-t bg-blue-600" style={{height:`${Math.max(a?5:0,a/max*185)}px`}}/><i className="flex-1 rounded-t bg-blue-200" style={{height:`${Math.max(b?5:0,b/max*185)}px`}}/><label className="absolute -bottom-6 w-full text-center text-[10px] text-slate-500">{d}</label></div>)}</div><p className="mt-8 text-[10px] text-slate-500"><i className="mr-1 inline-block size-2 rounded-full bg-blue-600"/>架電数 <i className="ml-3 mr-1 inline-block size-2 rounded-full bg-blue-200"/>接続数</p></>}
 function CardHead({title,sub,click}:{title:string;sub?:string;click?:()=>void}){return <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4"><h2 className="text-sm font-extrabold">{title}</h2>{sub&&<button onClick={click} className={`text-[11px] ${click?"font-bold text-blue-600":"text-slate-500"}`}>{sub}</button>}</div>}
 
-function Companies({companies,callCompany,add,bulkImport,csvImport,isAdmin,toggleBlock,openDetail}:{companies:Company[];callCompany:(c:Company)=>void;add:()=>void;bulkImport:()=>void;csvImport:()=>void;isAdmin:boolean;toggleBlock:(c:Company)=>void;openDetail:(companyId:string)=>void}) {
+function Companies({companies,callCompany,add,bulkImport,csvImport,isAdmin,toggleBlock,openDetail,recordingLock,refresh,notify}:{companies:Company[];callCompany:(c:Company)=>void;add:()=>void;bulkImport:()=>void;csvImport:()=>void;isAdmin:boolean;toggleBlock:(c:Company)=>void;openDetail:(companyId:string)=>void;recordingLock:CallRecorderLockState;refresh:()=>Promise<void>;notify:(s:string)=>void}) {
  const [q,setQ]=useState("");const [heat,setHeat]=useState("");const [more,setMore]=useState(false);const [showArchived,setShowArchived]=useState(false);
+ const [selectedIds,setSelectedIds]=useState<Set<string>>(new Set());
+ const [bulkArchiveModal,setBulkArchiveModal]=useState(false);
  const scoped=filterCompaniesByArchiveState(companies,showArchived);
  const filtered=scoped.filter(c=>(c.name+c.contact_name+c.phone+(c.website_url||"")).toLowerCase().includes(q.toLowerCase())&&(!heat||c.heat===heat));
+ // 検索キーワード・温度感・有効／アーカイブ済みタブのいずれかが変わったら選択状態を解除する
+ // （callIndexの補正等と同じ「レンダー中に状態を調整する」パターン。useEffectでの
+ // setStateはカスケードレンダーを招くため使わない）
+ const filterKey=`${q} ${heat} ${showArchived}`;
+ const [prevFilterKey,setPrevFilterKey]=useState(filterKey);
+ if(filterKey!==prevFilterKey){setPrevFilterKey(filterKey);if(selectedIds.size)setSelectedIds(new Set())}
+ // 一括選択・一括アーカイブはadmin専用、かつ「有効な企業」タブでのみ表示する
+ const canBulkSelect=isAdmin&&!showArchived;
+ const allVisibleSelected=canBulkSelect&&filtered.length>0&&filtered.every(c=>selectedIds.has(c.id));
+ const toggleSelectAll=()=>setSelectedIds(allVisibleSelected?new Set():new Set(filtered.map(c=>c.id)));
+ const toggleSelectOne=(id:string)=>setSelectedIds(prev=>{const next=new Set(prev);if(next.has(id))next.delete(id);else next.add(id);return next});
+ const selectedCompanies=filtered.filter(c=>selectedIds.has(c.id));
+ const openBulkArchive=()=>{
+  if(recordingLock.isRecording||recordingLock.hasPendingAudio){notify("録音中・未保存の録音がある間はアーカイブできません。録音を停止または破棄してから操作してください。");return}
+  setBulkArchiveModal(true);
+ };
  return <div className="fade-in">
   <div className="mb-3 flex flex-wrap items-center gap-2">
    <div className="relative min-w-[240px] flex-1 md:max-w-sm"><Search className="absolute left-3 top-2.5 size-4 text-slate-400"/><input className="input pl-9" placeholder="企業名・担当者名・電話・URLで検索" value={q} onChange={e=>setQ(e.target.value)}/></div>
@@ -190,7 +209,16 @@ function Companies({companies,callCompany,add,bulkImport,csvImport,isAdmin,toggl
    <button className={`rounded-lg px-3 py-1.5 text-xs font-bold ${!showArchived?"bg-blue-600 text-white":"bg-white text-slate-500 border border-slate-200"}`} onClick={()=>setShowArchived(false)}>有効な企業</button>
    <button className={`rounded-lg px-3 py-1.5 text-xs font-bold ${showArchived?"bg-blue-600 text-white":"bg-white text-slate-500 border border-slate-200"}`} onClick={()=>setShowArchived(true)}>アーカイブ済み</button>
   </div>
-  <div className="card overflow-x-auto"><table className="w-full min-w-[1180px] border-collapse"><thead><tr className="bg-slate-50 text-left text-[10px] text-slate-500">{["企業名","URL","業種","担当者","温度感","最終架電","次回対応","担当",showArchived?"アーカイブ日時":"","",""].map((x,i)=><th className="border-b border-slate-200 px-4 py-3" key={i}>{x}</th>)}</tr></thead><tbody>{filtered.map(c=><tr key={c.id} className={`text-xs hover:bg-slate-50 ${c.call_prohibited?"bg-red-50/40":""} ${isCompanyArchived(c)?"opacity-70":""}`}>
+  {canBulkSelect&&selectedIds.size>0&&<div className="mb-3 flex flex-wrap items-center gap-3 rounded-lg bg-blue-50 px-4 py-2.5 text-xs">
+   <span className="font-bold text-blue-800">{selectedIds.size}件選択中</span>
+   <button className="font-bold text-slate-500 hover:text-slate-700" onClick={()=>setSelectedIds(new Set())}>選択を解除</button>
+   <button className="btn btn-primary !py-1.5 ml-auto text-xs" onClick={openBulkArchive}><Archive size={13}/>選択した{selectedIds.size}件をアーカイブ</button>
+  </div>}
+  <div className="card overflow-x-auto"><table className="w-full min-w-[1180px] border-collapse"><thead><tr className="bg-slate-50 text-left text-[10px] text-slate-500">
+    {canBulkSelect&&<th className="w-10 border-b border-slate-200 px-4 py-3"><input type="checkbox" checked={allVisibleSelected} onChange={toggleSelectAll} aria-label="表示中の企業をすべて選択"/></th>}
+    {["企業名","URL","業種","担当者","温度感","最終架電","次回対応","担当",showArchived?"アーカイブ日時":"","",""].map((x,i)=><th className="border-b border-slate-200 px-4 py-3" key={i}>{x}</th>)}
+  </tr></thead><tbody>{filtered.map(c=><tr key={c.id} className={`text-xs hover:bg-slate-50 ${c.call_prohibited?"bg-red-50/40":""} ${isCompanyArchived(c)?"opacity-70":""}`}>
+   {canBulkSelect&&<td className="border-b border-slate-100 p-4"><input type="checkbox" checked={selectedIds.has(c.id)} onChange={()=>toggleSelectOne(c.id)} aria-label={`${c.name}を選択`}/></td>}
    <td className="border-b border-slate-100 p-4"><button className="text-left font-bold text-[#172036] hover:text-blue-600" onClick={()=>openDetail(c.id)}>{c.name}</button>{isCompanyArchived(c)&&<span className="badge ml-2 bg-slate-200 text-slate-600">アーカイブ済み</span>}{c.call_prohibited&&<span className="badge ml-2 bg-red-100 text-red-700"><ShieldAlert size={11} className="mr-0.5 inline"/>架電禁止</span>}<small className="mt-1 block text-[10px] text-slate-500">{c.location} ／ {c.phone}</small>{c.call_prohibited&&<small className="mt-0.5 block text-[10px] font-bold text-red-600">一致条件：{matchScopeLabel(c.blocked_scope||"")}／理由：{c.blocked_reason||"（理由未設定）"}</small>}</td>
    <td className="border-b border-slate-100 p-4">{c.website_url?<a className="inline-flex items-center gap-1 font-bold text-blue-600" href={c.website_url} target="_blank" rel="noreferrer">確認<ExternalLink size={12}/></a>:<a className="text-slate-400 underline" href={searchUrl(c.name)} target="_blank" rel="noreferrer">検索</a>}</td>
    <td className="border-b border-slate-100 p-4">{c.industry}</td>
@@ -207,7 +235,36 @@ function Companies({companies,callCompany,add,bulkImport,csvImport,isAdmin,toggl
     ?<button className="flex items-center gap-1 text-[11px] font-bold text-emerald-600" onClick={()=>openDetail(c.id)}><ArchiveRestore size={12}/>復元</button>
     :<button className={`text-[11px] font-bold ${c.call_prohibited?"text-emerald-600":"text-red-600"}`} onClick={()=>toggleBlock(c)}>{c.call_prohibited?"解除":"禁止"}</button>)}</td>
   </tr>)}</tbody></table>{!filtered.length&&<p className="p-16 text-center text-sm text-slate-500">{showArchived?"アーカイブ済みの企業はありません":"該当する企業がありません"}</p>}</div>
+  {bulkArchiveModal&&<BulkArchiveConfirmModal companies={selectedCompanies} close={()=>setBulkArchiveModal(false)} done={async()=>{await refresh();setSelectedIds(new Set());setBulkArchiveModal(false)}} notify={notify} recordingLock={recordingLock}/>}
  </div>
+}
+
+function BulkArchiveConfirmModal({companies,close,done,notify,recordingLock}:{companies:Company[];close:()=>void;done:()=>Promise<void>;notify:(s:string)=>void;recordingLock:CallRecorderLockState}) {
+ const [busy,setBusy]=useState(false);
+ const {shownNames,moreCount}=buildBulkArchivePreview(companies);
+ const submit=async()=>{
+  if(busy||companies.length===0)return;
+  // モーダルを開いた後に録音が始まった場合に備え、実行直前にも同じ安全ルールを再確認する
+  if(recordingLock.isRecording||recordingLock.hasPendingAudio){notify("録音中・未保存の録音がある間はアーカイブできません。録音を停止または破棄してから操作してください。");close();return}
+  setBusy(true);
+  try{
+   const result=await archiveCompanies(companies.map(c=>c.id));
+   await done();
+   notify(bulkArchiveResultMessage(result));
+  }catch(e){notify(e instanceof Error?e.message:"アーカイブに失敗しました")}
+  finally{setBusy(false)}
+ };
+ return <Modal title="選択した企業をアーカイブ" sub={`${companies.length}件`} close={close}>
+  <ul className="mb-3 list-disc space-y-0.5 pl-5 text-xs text-slate-700">
+   {shownNames.map((name,i)=><li key={`${name}-${i}`}>{name}</li>)}
+   {moreCount>0&&<li className="text-slate-500">ほか{moreCount}件</li>}
+  </ul>
+  <p className="mb-3 rounded-lg bg-amber-50 p-3 text-xs text-amber-800">選択した企業を企業一覧と架電リストから外します。過去の架電履歴と架電禁止設定は削除されません。アーカイブ済み一覧から後で復元できます。</p>
+  <div className="flex gap-2">
+   <button className="btn btn-light flex-1" disabled={busy} onClick={close}>キャンセル</button>
+   <button disabled={busy||!companies.length} onClick={submit} className="btn flex-1 bg-red-600 text-white hover:bg-red-700 disabled:opacity-50">{busy?"処理中…":`${companies.length}件をアーカイブ`}</button>
+  </div>
+ </Modal>;
 }
 function HeatBadge({heat}:{heat:Heat}) {return <span className={`badge ${heat==="高"?"bg-red-50 text-red-600":heat==="中"?"bg-amber-50 text-amber-700":"bg-slate-100 text-slate-600"}`}>● {heat}</span>}
 
